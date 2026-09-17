@@ -111,9 +111,15 @@ public class ConfigProvider extends ContentProvider {
     }
 
     /**
-     * 写入配置：通过 content:// URI 的最后一个路径段作为 key，
-     * ContentValues 中 'value' 列作为 value。
-     * 仅允许调用方白名单放行。
+     * 写入配置：URI 最后一段为 key，ContentValues 的 'value' 列为值。
+     *
+     * <p><b>类型保真</b>：默认把值按 boolean / int / long / String 推断后<b>按原类型</b>
+     * 写入 prefs。这一点必须做到，因为读回路径 {@code ConfigManager.getStringInTarget()}
+     * 走的是 {@code String.valueOf(cursor.getString(...))}，而 Provider 的 query 也是
+     * {@code String.valueOf(value)}；只要写侧存的是原生类型，两侧都能正确还原。
+     * 若这里统一存成 String，{@code prefs.getAll()} 会返回 String，UI 侧
+     * {@code getBoolean(key, default)} / {@code getInt(key, default)} 读取时
+     * 会抛 ClassCastException 并回退默认值 —— 表现为「面板上改了、重启后变回去」。</p>
      */
     @Override
     public Uri insert(Uri uri, ContentValues values) {
@@ -125,9 +131,34 @@ public class ConfigProvider extends ContentProvider {
         String value = values.getAsString("value");
         if (value == null) return null;
 
-        prefs.edit().putString(key, value).apply();
+        writeTyped(key, value);
         XposedBridge.log("[XiaoBuBridge] ConfigProvider: wrote " + key + "=" + value);
         return uri.buildUpon().appendPath(key).build();
+    }
+
+    /** 按值的内容推断类型后写入，保证 UI 侧按同名类型读回 */
+    private void writeTyped(String key, String value) {
+        SharedPreferences.Editor editor = prefs.edit();
+        String trimmed = value.trim();
+        if ("true".equalsIgnoreCase(trimmed) || "false".equalsIgnoreCase(trimmed)) {
+            editor.putBoolean(key, Boolean.parseBoolean(trimmed));
+        } else {
+            Integer asInt = tryParseInt(trimmed);
+            if (asInt != null) {
+                editor.putInt(key, asInt);
+            } else {
+                editor.putString(key, value);
+            }
+        }
+        editor.apply();
+    }
+
+    private static Integer tryParseInt(String s) {
+        try {
+            return Integer.valueOf(Integer.parseInt(s));
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     @Override
@@ -145,8 +176,7 @@ public class ConfigProvider extends ContentProvider {
         String value = values.getAsString("value");
         if (value == null) return 0;
 
-        prefs.edit().putString(key, value).apply();
-        XposedBridge.log("[XiaoBuBridge] ConfigProvider: updated " + key + "=" + value);
+        writeTyped(key, value);
         return 1;
     }
 }

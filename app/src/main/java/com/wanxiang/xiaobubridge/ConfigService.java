@@ -52,6 +52,16 @@ public class ConfigService extends Service {
                 return String.valueOf(ConfigManager.isAutoWakeEnabled(ctx));
             } else if (ConfigManager.KEY_KEEP_ALIVE_ENABLED.equals(key)) {
                 return String.valueOf(ConfigManager.isKeepAliveEnabled(ctx));
+            } else if (ConfigManager.KEY_API_FORMAT.equals(key)) {
+                return ConfigManager.getApiFormat(ctx);
+            } else if (ConfigManager.KEY_CORS_ENABLED.equals(key)) {
+                return String.valueOf(ConfigManager.isCorsEnabled(ctx));
+            } else if (ConfigManager.KEY_AUTO_RETRY_ENABLED.equals(key)) {
+                return String.valueOf(ConfigManager.isAutoRetryEnabled(ctx));
+            } else if (ConfigManager.KEY_AUTO_RETRY_MAX.equals(key)) {
+                return String.valueOf(ConfigManager.getAutoRetryMax(ctx));
+            } else if (ConfigManager.KEY_REQUEST_TIMEOUT_MS.equals(key)) {
+                return String.valueOf(ConfigManager.getRequestTimeoutMs(ctx));
             }
             return "";
         }
@@ -91,6 +101,24 @@ public class ConfigService extends Service {
                 ConfigManager.setAutoWakeEnabled(ctx, "true".equalsIgnoreCase(value));
             } else if (ConfigManager.KEY_KEEP_ALIVE_ENABLED.equals(key)) {
                 ConfigManager.setKeepAliveEnabled(ctx, "true".equalsIgnoreCase(value));
+            } else if (ConfigManager.KEY_API_FORMAT.equals(key)) {
+                ConfigManager.setApiFormat(ctx, value);
+            } else if (ConfigManager.KEY_CORS_ENABLED.equals(key)) {
+                ConfigManager.setCorsEnabled(ctx, "true".equalsIgnoreCase(value));
+            } else if (ConfigManager.KEY_AUTO_RETRY_ENABLED.equals(key)) {
+                ConfigManager.setAutoRetryEnabled(ctx, "true".equalsIgnoreCase(value));
+            } else if (ConfigManager.KEY_AUTO_RETRY_MAX.equals(key)) {
+                try {
+                    ConfigManager.setAutoRetryMax(ctx, Integer.parseInt(value.trim()));
+                } catch (Throwable ignored) {
+                    // 非法重试次数忽略，保留旧值
+                }
+            } else if (ConfigManager.KEY_REQUEST_TIMEOUT_MS.equals(key)) {
+                try {
+                    ConfigManager.setRequestTimeoutMs(ctx, Integer.parseInt(value.trim()));
+                } catch (Throwable ignored) {
+                    // 非法超时值忽略，保留旧值
+                }
             }
         }
 
@@ -122,6 +150,11 @@ public class ConfigService extends Service {
                 json.put("chunkedStream", ConfigManager.isChunkedStreamEnabled(ConfigService.this));
                 json.put("autoWake", ConfigManager.isAutoWakeEnabled(ConfigService.this));
                 json.put("keepAlive", ConfigManager.isKeepAliveEnabled(ConfigService.this));
+                json.put("apiFormat", ConfigManager.getApiFormat(ConfigService.this));
+                json.put("corsEnabled", ConfigManager.isCorsEnabled(ConfigService.this));
+                json.put("autoRetry", ConfigManager.isAutoRetryEnabled(ConfigService.this));
+                json.put("autoRetryMax", ConfigManager.getAutoRetryMax(ConfigService.this));
+                json.put("requestTimeoutMs", ConfigManager.getRequestTimeoutMs(ConfigService.this));
                 json.put("pid", android.os.Process.myPid());
                 json.put("time", System.currentTimeMillis());
             } catch (Throwable t) {

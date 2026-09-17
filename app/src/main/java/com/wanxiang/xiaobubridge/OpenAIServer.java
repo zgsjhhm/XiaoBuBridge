@@ -45,6 +45,14 @@ public class OpenAIServer {
     private static final String TAG = "[XiaoBuBridge]";
     /** 响应等待超时（会话轮询 / 非流式等待上限） */
     private static final long STREAM_TIMEOUT_MS = 60 * 1000L;
+
+    /**
+     * 自动重试前的退避等待。
+     *
+     * <p>注入零回调往往是小布上一轮的回答回调尚未彻底收尾；立刻重试容易
+     * 撞上同一个状态，等一小段再试成功率明显更高。</p>
+     */
+    private static final long RETRY_BACKOFF_MS = 800L;
     /** 请求读取阶段超时：正常客户端应瞬时发完请求，超时即视为异常连接 */
     private static final long REQUEST_READ_TIMEOUT_MS = 20 * 1000L;
     /**
@@ -224,6 +232,8 @@ public class OpenAIServer {
         });
         acceptThread.setDaemon(true);
         acceptThread.start();
+        GatewayStats.reset();
+        GatewayStats.markListening("127.0.0.1", port);
         logBoth("OpenAI-compatible server started on port " + port);
         File lf = getLogFile();
         logBoth("Log file = " + (lf != null ? lf.getAbsolutePath() : "(unavailable, logcat only)"));
@@ -315,11 +325,24 @@ public class OpenAIServer {
                 } else {
                     resp = handleModels();
                 }
-            } else if ("/v1/chat/completions".equals(uri) && "POST".equalsIgnoreCase(method)) {
+            } else if ("/health".equals(uri) && "GET".equalsIgnoreCase(method)) {
+                // 探活故意不鉴权：否则 API Key 开启后，任何探活都会得到 401，
+                // 调用方没法把「服务活着但要鉴权」和「服务根本没起来」区分开。
+                // 响应体不含任何配置信息。
+                resp = new Response(200, "application/json", GatewayStats.health().toString());
+            } else if ("/status".equals(uri) && "GET".equalsIgnoreCase(method)) {
                 if (!checkApiKey(headers)) {
                     resp = unauthorized();
                 } else {
-                    resp = handleChatCompletions(body, out);
+                    resp = handleStatus();
+                }
+            } else if ("/v1/chat/completions".equals(uri) && "POST".equalsIgnoreCase(method)) {
+                if (!openAiFormatEnabled()) {
+                    resp = formatDisabled("OpenAI");
+                } else if (!checkApiKey(headers)) {
+                    resp = unauthorized();
+                } else {
+                    resp = handleChatCompletions(body, out, null);
                     if (resp == null) {
                         // v3.6 真流式：响应头与分片已在持锁期间直接写进 socket，
                         // 这里不能再走 writeResponse，否则会往同一连接写第二份响应。
@@ -327,8 +350,35 @@ public class OpenAIServer {
                         return;
                     }
                 }
+            } else if ("/v1/messages".equals(uri) && "POST".equalsIgnoreCase(method)) {
+                if (!anthropicFormatEnabled()) {
+                    resp = formatDisabled("Anthropic");
+                } else if (!checkApiKey(headers)) {
+                    resp = unauthorized();
+                } else {
+                    // Anthropic 走同一个注入链路，只是请求/响应体格式不同；
+                    // 复用 OpenAI 分支的解析与重试逻辑，仅在出入参上做转换。
+                    resp = handleChatCompletions(body, out, "anthropic");
+                    if (resp == null) {
+                        logBoth("RESP 200 " + uri + " (anthropic chunked stream written)");
+                        return;
+                    }
+                }
+            } else if ("/v1/completions".equals(uri) && "POST".equalsIgnoreCase(method)) {
+                if (!openAiFormatEnabled()) {
+                    resp = formatDisabled("OpenAI");
+                } else if (!checkApiKey(headers)) {
+                    resp = unauthorized();
+                } else {
+                    resp = handleChatCompletions(body, out, "legacy");
+                    if (resp == null) {
+                        logBoth("RESP 200 " + uri + " (legacy chunked stream written)");
+                        return;
+                    }
+                }
             } else {
-                resp = new Response(404, "application/json", "{\"error\":{\"message\":\"Not Found\"}}");
+                resp = new Response(404, "application/json",
+                        "{\"error\":{\"message\":\"Not Found\",\"type\":\"invalid_request_error\"}}");
             }
             addCorsHeaders(resp);
             writeResponse(out, resp);
@@ -402,16 +452,39 @@ public class OpenAIServer {
                 "{\"error\":{\"message\":\"Invalid API key\",\"type\":\"invalid_request_error\"}}");
     }
 
+    /** 该格式被 API 格式设置关闭时的响应 */
+    private Response formatDisabled(String which) {
+        GatewayStats.countError("format_disabled");
+        return new Response(404, "application/json",
+                "{\"error\":{\"message\":\"" + which
+                        + " 端点已关闭：请在设置页把 API 格式改为对应选项。\","
+                        + "\"type\":\"invalid_request_error\"}}");
+    }
+
+    private boolean openAiFormatEnabled() {
+        String f = ConfigManager.getApiFormatInTarget();
+        return ConfigManager.API_FORMAT_OPENAI.equals(f) || ConfigManager.API_FORMAT_BOTH.equals(f);
+    }
+
+    private boolean anthropicFormatEnabled() {
+        String f = ConfigManager.getApiFormatInTarget();
+        return ConfigManager.API_FORMAT_ANTHROPIC.equals(f)
+                || ConfigManager.API_FORMAT_BOTH.equals(f);
+    }
+
+    /** 运行统计（对应参照物的 GET /status） */
+    private Response handleStatus() {
+        return new Response(200, "application/json", GatewayStats.snapshot().toString());
+    }
+
     private Response handleModels() {
         try {
-            JSONObject model = new JSONObject();
-            model.put("id", "xiaobu");
-            model.put("object", "model");
-            model.put("created", System.currentTimeMillis() / 1000);
-            model.put("owned_by", "oppo-xiaobu");
-
             JSONArray data = new JSONArray();
-            data.put(model);
+
+            // 两个模型 id：xiaobu 走 OpenAI 协议，xiaobu-anthropic 显式指向
+            // Anthropic 协议。客户端只需换 model 名即可，无需改 Base URL。
+            data.put(modelEntry("xiaobu", "oppo-xiaobu"));
+            data.put(modelEntry("xiaobu-anthropic", "oppo-xiaobu"));
 
             JSONObject result = new JSONObject();
             result.put("object", "list");
@@ -420,17 +493,47 @@ public class OpenAIServer {
             return new Response(200, "application/json", result.toString());
         } catch (Exception e) {
             logBoth("handleModels error: " + e.getMessage());
-            return new Response(500, "application/json", "{\"error\":{\"message\":\"Internal Error\"}}");
+            return new Response(500, "application/json",
+                    "{\"error\":{\"message\":\"Internal Error\",\"type\":\"api_error\"}}");
         }
     }
 
-    private Response handleChatCompletions(String body, OutputStream out) {
+    private JSONObject modelEntry(String id, String owner) throws Exception {
+        JSONObject model = new JSONObject();
+        model.put("id", id);
+        model.put("object", "model");
+        model.put("created", System.currentTimeMillis() / 1000);
+        model.put("owned_by", owner);
+        return model;
+    }
+
+    /**
+     * 对话主入口。
+     *
+     * @param format {@code null}=OpenAI（默认）、{@code "anthropic"}、{@code "legacy"}
+     */
+    private Response handleChatCompletions(String body, OutputStream out, String format) {
         JSONObject request;
         try {
             request = new JSONObject(body);
         } catch (Exception e) {
-            return new Response(400, "application/json", "{\"error\":{\"message\":\"Invalid JSON\"}}");
+            GatewayStats.countError("invalid_json");
+            return new Response(400, "application/json",
+                    "{\"error\":{\"message\":\"Invalid JSON\",\"type\":\"invalid_request_error\"}}");
         }
+
+        GatewayStats.incrRequests();
+        GatewayStats.incrActive();
+        long startedAt = System.currentTimeMillis();
+
+        // 工具调用层的日志与网关同源：排查时要能在同一份落盘日志里对着看
+        // 「注入文本多长 / 解析出几个调用」，否则两处日志互相对不上时间轴。
+        ToolCallPrompt.setLogger(new ToolCallPrompt.Logger() {
+            @Override
+            public void log(String msg) {
+                logBoth("[toolcall] " + msg);
+            }
+        });
 
         // 并发限流：拿不到令牌直接 429，避免把小布对话链路压垮
         Semaphore limiter = concurrencyLimiter;
@@ -438,21 +541,67 @@ public class OpenAIServer {
         if (limiter != null) {
             acquired = limiter.tryAcquire();
             if (!acquired) {
+                GatewayStats.decrActive();
+                GatewayStats.incrFailed();
+                GatewayStats.countError("concurrency_limit");
                 logBoth("Rejected: concurrency limit reached");
                 return new Response(429, "application/json",
-                        "{\"error\":{\"message\":\"Too many concurrent requests\",\"type\":\"rate_limit_error\"}}");
+                        "{\"error\":{\"message\":\"Too many concurrent requests\","
+                                + "\"type\":\"rate_limit_error\"}}");
             }
         }
         try {
-            return doChatCompletions(request, out);
+            Response resp = doChatCompletions(request, out, format);
+            if (resp != null && resp.code >= 400) {
+                GatewayStats.incrFailed();
+            }
+            return resp;
+        } catch (Throwable t) {
+            GatewayStats.incrFailed();
+            GatewayStats.countError("internal");
+            GatewayStats.setLastError(String.valueOf(t.getMessage()));
+            logBoth("handleChatCompletions error: " + t);
+            return new Response(500, "application/json",
+                    "{\"error\":{\"message\":\"Internal Error\",\"type\":\"api_error\"}}");
         } finally {
             if (acquired && limiter != null) {
                 limiter.release();
             }
+            GatewayStats.decrActive();
+            GatewayStats.addLatency(System.currentTimeMillis() - startedAt);
         }
     }
 
-    private Response doChatCompletions(JSONObject request, OutputStream out) {
+    /**
+     * 从请求体里取用户消息文本。
+     *
+     * <p>三种格式的取法不同：</p>
+     * <ul>
+     *   <li>OpenAI / Anthropic：最后一条 {@code role=user} 的 {@code content}；
+     *       Anthropic 的 content 还可能是 {@code [{type:text,text:...}]} 数组；</li>
+     *   <li>Legacy /v1/completions：{@code prompt} 字段，可以是字符串也可能是字符串数组。</li>
+     * </ul>
+     */
+    private String extractUserMessage(JSONObject request, String format) {
+        if ("legacy".equals(format)) {
+            Object prompt = request.opt("prompt");
+            if (prompt instanceof JSONArray) {
+                JSONArray arr = (JSONArray) prompt;
+                if (arr.length() > 0) {
+                    return String.valueOf(arr.opt(0));
+                }
+                return null;
+            }
+            if (prompt != null) {
+                return String.valueOf(prompt);
+            }
+            // 兼容部分客户端会用 messages 调 legacy 端点
+            return extractLastUserMessage(request);
+        }
+        return extractLastUserMessage(request);
+    }
+
+    private Response doChatCompletions(JSONObject request, OutputStream out, String format) {
         boolean stream = request.optBoolean("stream", false);
         // v3.6 真流式：只有「stream=true 且客户端要 chunked」时才走直接写 socket 的路径。
         // 其余情况保持旧行为（攒完整报文一次性返回），避免影响既有客户端。
@@ -460,11 +609,28 @@ public class OpenAIServer {
                 && out != null
                 && ConfigManager.isChunkedStreamEnabledInTarget();
         String requestId = UUID.randomUUID().toString().replace("-", "");
-        logBoth("Chat request, stream=" + stream + ", chunked=" + chunked + ", id=" + requestId);
+        logBoth("Chat request, format=" + (format == null ? "openai" : format)
+                + ", stream=" + stream + ", chunked=" + chunked + ", id=" + requestId);
 
-        String userMsg = extractLastUserMessage(request);
+        String userMsg = extractUserMessage(request, format);
         if (userMsg != null) {
             logBoth("User msg: " + userMsg.substring(0, Math.min(50, userMsg.length())));
+        }
+
+        // v3.8 工具调用：仅 OpenAI 格式（Anthropic 的 tool_use 与 legacy 契约语义不同，
+        // 本轮不混用，避免把「半套支持」当成完整支持）。
+        // 带工具时必须折叠**整段** messages —— 工具结果（role=tool）与历史调用是
+        // 模型继续调用所必需的上文；无工具路径只取最后一条 user，够用且更省预算。
+        boolean openAiFormat = (format == null || "openai".equals(format));
+        JSONArray tools = openAiFormat ? request.optJSONArray("tools") : null;
+        boolean toolsRequest = tools != null && tools.length() > 0;
+        String toolInjectText = null;
+        if (toolsRequest) {
+            toolInjectText = ToolCallBridge.buildInjectText(
+                    request, ConfigManager.getSystemPromptInTarget());
+            logBoth("Tool request: tools=" + tools.length()
+                    + ", tool_choice=" + request.opt("tool_choice")
+                    + ", injectText=" + toolInjectText.length() + "c");
         }
 
         // v3.6 自动唤醒：小布在后台时注入不报错但零回调，必须先拉到前台。
@@ -475,7 +641,7 @@ public class OpenAIServer {
             logBoth("AutoWake result=" + foreground
                     + ", cost=" + (System.currentTimeMillis() - wakeStart) + "ms");
             if (!foreground) {
-                logBoth("AutoWake failed; injection would produce no callback, aborting round");
+                GatewayStats.countError("not_foreground");
                 // 用 503 而不是 200：这是「暂时不可用、重试可能成功」，客户端网关与
                 // OpenAI SDK 都能据此走重试逻辑；塞在 200 里会被当成正常回答内容。
                 return new Response(503, "application/json",
@@ -490,19 +656,56 @@ public class OpenAIServer {
         // 都在同一把锁内完成：否则后到的请求会重置前一个请求正在读取的会话对象。
         dialogLock.lock();
         try {
-            ConversationSession.beginExternalRound();
-            ConversationSession session = runInjectedRound(requestId, userMsg);
-            if (session == null) {
-                logBoth("No active conversation, returning error body");
-                return new Response(200, "application/json",
-                        "{\"error\":{\"message\":\"No active conversation. Please ask XiaoBu first.\"}}");
+            int maxRetry = ConfigManager.isAutoRetryEnabledInTarget()
+                    ? ConfigManager.getAutoRetryMaxInTarget() : 0;
+            ConversationSession session = null;
+
+            // 重试语义：只有「注入成功但零回调」才重试。这类失败是小布的偶发丢回调，
+            // 重来一轮通常能成。会话已产生内容但未 completed 属于正在生成，不能重试
+            // ——那会把半截回答丢掉并浪费一次完整的等待窗口。
+            for (int attempt = 0; attempt <= maxRetry; attempt++) {
+                ConversationSession.beginExternalRound();
+                session = runInjectedRound(requestId, userMsg, toolInjectText);
+                if (session != null) {
+                    if (attempt > 0) {
+                        GatewayStats.incrAutoRetries();
+                    }
+                    break;
+                }
+                if (attempt < maxRetry) {
+                    logBoth("No callback on attempt " + (attempt + 1) + "/" + (maxRetry + 1)
+                            + ", retrying after backoff");
+                    try {
+                        Thread.sleep(RETRY_BACKOFF_MS);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
             }
+
+            if (session == null) {
+                GatewayStats.countError("no_callback");
+                logBoth("No active conversation after retries, returning error body");
+                // 保留 200 + error 体：与旧版行为一致，避免破坏既有客户端；
+                // 调用方可据 error 字段判断。
+                return new Response(200, "application/json",
+                        "{\"error\":{\"message\":\"No active conversation after "
+                                + (maxRetry + 1) + " attempt(s). XiaoBu produced no callback.\","
+                                + "\"type\":\"upstream_error\"}}");
+            }
+
+            GatewayStats.incrInjectedRounds();
+
             if (chunked) {
                 // 返回 null 表示响应已由本方法直接写入并关闭
-                return writeChunkedStreamResponse(out, session, requestId);
+                return writeChunkedStreamResponse(out, session, requestId, format,
+                        request, toolsRequest);
             }
-            return stream ? buildStreamResponse(session, requestId)
-                          : buildNonStreamResponse(session, requestId);
+            if (stream) {
+                return buildStreamResponse(session, requestId, format, request, toolsRequest);
+            }
+            return buildNonStreamResponse(session, requestId, format, request, toolsRequest);
         } finally {
             dialogLock.unlock();
         }
@@ -511,14 +714,23 @@ public class OpenAIServer {
     /**
      * 在对话框串行锁内完成的注入与等待阶段。
      *
+     * @param toolInjectText 带工具请求时已组装好的注入文本（含系统提示词与工具协议）；
+     *                       非空时优先使用，且<b>不再</b>追加系统提示词 —— 它已经
+     *                       并进折叠文本并参与了预算计算，再拼一次会顶过小布上限。
      * @return 本轮会话；拿不到返回 null（由调用方转成错误响应）
      */
-    private ConversationSession runInjectedRound(String requestId, String userMsg) {
-        // 系统提示词：仅拼接到实际注入小布的文本上，不改变返回体
-        String injectText = userMsg;
-        String systemPrompt = ConfigManager.getSystemPromptInTarget();
-        if (userMsg != null && systemPrompt != null && !systemPrompt.trim().isEmpty()) {
-            injectText = systemPrompt.trim() + "\n\n" + userMsg;
+    private ConversationSession runInjectedRound(String requestId, String userMsg,
+                                                 String toolInjectText) {
+        String injectText;
+        if (toolInjectText != null && !toolInjectText.isEmpty()) {
+            injectText = toolInjectText;
+        } else {
+            // 系统提示词：仅拼接到实际注入小布的文本上，不改变返回体
+            injectText = userMsg;
+            String systemPrompt = ConfigManager.getSystemPromptInTarget();
+            if (userMsg != null && systemPrompt != null && !systemPrompt.trim().isEmpty()) {
+                injectText = systemPrompt.trim() + "\n\n" + userMsg;
+            }
         }
 
         boolean injected = false;
@@ -543,9 +755,11 @@ public class OpenAIServer {
     private ConversationSession waitForActiveSession(String requestId, boolean waitForInjectedResponse) {
         // 只接受本轮屏障之后登记的会话，旧轮次即使仍在内存中也不可见。
         ConversationSession s = null;
-        // 注入后的回调可能受网络和主线程调度影响，最多等待 60 秒。
-        int maxWait = waitForInjectedResponse ? 240 : 40;
-        for (int i = 0; i < maxWait; i++) {
+        // 注入后的回调可能受网络和主线程调度影响，等待上限由设置页的
+        // 「请求超时」控制（默认 60 秒），而非写死的 60 秒。
+        long deadline = System.currentTimeMillis()
+                + ConfigManager.getRequestTimeoutMsInTarget();
+        while (System.currentTimeMillis() < deadline) {
             ConversationSession candidate = ConversationSession.getCurrentRound(5 * 60 * 1000L);
             if (candidate != null) {
                 if (waitForInjectedResponse) {
@@ -581,15 +795,26 @@ public class OpenAIServer {
      * 但 chunk 全卡在本地，客户端只能等到超时。表现为「等 1~2 分钟才一次性收到
      * 全部内容」。现在改为 50ms 粒度轮询，由本方法自行掌握超时。</p>
      */
-    private Response buildStreamResponse(ConversationSession session, String requestId) {
+    private Response buildStreamResponse(ConversationSession session, String requestId,
+                                         String format, JSONObject request,
+                                         boolean toolsRequest) {
+        if (toolsRequest) {
+            // 带工具时不能边收边发：整段回答在收完之前无法判断它是「工具调用块」
+            // 还是「普通正文」，把调用块的 XML 原样流给客户端等于给了一个坏响应。
+            // 调用块本身很短，缓冲的代价可忽略。
+            return buildBufferedToolStreamResponse(session, requestId, format, request);
+        }
         StringBuilder sb = new StringBuilder();
         long startTime = System.currentTimeMillis();
         String completionId = "chatcmpl-" + requestId;
+        boolean anthropic = "anthropic".equals(format);
 
         while (true) {
             String content = session.pollContent(POLL_GRANULARITY_MS);
             if (content != null) {
-                sb.append("data: ").append(buildChunk(completionId, content, false)).append("\n\n");
+                sb.append(anthropic
+                        ? anthropicEvent("content_block_delta", requestId, content, null)
+                        : "data: " + buildChunk(completionId, content, false) + "\n\n");
                 // 队列可能还有积压，本轮继续取，不再额外等待
                 continue;
             }
@@ -598,10 +823,18 @@ public class OpenAIServer {
                 // 收尾：把队列剩余内容全部取空，避免最后几个片段丢失
                 String remaining;
                 while ((remaining = session.pollContent(0)) != null) {
-                    sb.append("data: ").append(buildChunk(completionId, remaining, false)).append("\n\n");
+                    sb.append(anthropic
+                            ? anthropicEvent("content_block_delta", requestId, remaining, null)
+                            : "data: " + buildChunk(completionId, remaining, false) + "\n\n");
                 }
-                sb.append("data: ").append(buildChunk(completionId, null, true)).append("\n\n");
-                sb.append("data: [DONE]\n\n");
+                if (anthropic) {
+                    sb.append(anthropicEvent("content_block_stop", requestId, null, null));
+                    sb.append(anthropicEvent("message_delta", requestId, null, "end_turn"));
+                    sb.append(anthropicEvent("message_stop", requestId, null, null));
+                } else {
+                    sb.append("data: ").append(buildChunk(completionId, null, true)).append("\n\n");
+                    sb.append("data: [DONE]\n\n");
+                }
                 break;
             }
 
@@ -610,6 +843,75 @@ public class OpenAIServer {
                 break;
             }
         }
+
+        Response resp = new Response(200, "text/event-stream", sb.toString());
+        resp.headers.put("Cache-Control", "no-cache");
+        resp.headers.put("Connection", "keep-alive");
+        return resp;
+    }
+
+    /**
+     * 带工具请求的（非 chunked）流式响应：缓冲到完成再重放为 SSE。
+     *
+     * <p>为什么不能边收边发：小布的输出里，工具调用是一段 XML 块。在整段回答
+     * 收完之前无法判断这次是「调用工具」还是「普通回答」，而两种情况的
+     * {@code finish_reason} 与 delta 形状完全不同（{@code tool_calls} vs {@code stop}）。
+     * 把调用块的 XML 原样流给客户端，对方会把它当正文渲染出来。</p>
+     *
+     * <p>缓冲的代价可接受：调用块本身只有一两百字符，且客户端此时本来就要等
+     * 工具结果，不差这一小段时序差。真流式的价值在长文本回答上，那条路径
+     * （无工具请求）保持原样未动。</p>
+     */
+    private Response buildBufferedToolStreamResponse(ConversationSession session, String requestId,
+                                                     String format, JSONObject request) {
+        if (!session.isCompleted()) {
+            long deadline = System.currentTimeMillis() + ConfigManager.getRequestTimeoutMsInTarget();
+            while (!session.isCompleted() && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        String fullContent = session.getFullContent();
+        String completionId = "chatcmpl-" + requestId;
+        JSONArray calls = ToolCallBridge.extractCalls(request, fullContent);
+        StringBuilder sb = new StringBuilder();
+
+        // 首帧：声明角色（SDK 按它初始化 assistant 消息容器）
+        try {
+            JSONObject first = buildChunk(completionId, null, false);
+            first.getJSONArray("choices").getJSONObject(0).getJSONObject("delta")
+                    .put("role", "assistant");
+            sb.append("data: ").append(first).append("\n\n");
+        } catch (Exception ignored) {
+        }
+
+        if (calls.length() > 0) {
+            logBoth("Tool calls parsed (stream): " + calls.length()
+                    + ", names=" + ToolCallBridge.callNames(calls));
+            String head = ToolCallBridge.headText(fullContent);
+            if (!head.isEmpty()) {
+                sb.append("data: ").append(buildChunk(completionId, head, false)).append("\n\n");
+            }
+            sb.append("data: ").append(ToolCallBridge.buildToolCallsChunk(completionId, calls))
+                    .append("\n\n");
+            JSONObject fin = buildChunk(completionId, null, true);
+            try {
+                fin.getJSONArray("choices").getJSONObject(0).put("finish_reason", "tool_calls");
+            } catch (Exception ignored) {
+            }
+            sb.append("data: ").append(fin).append("\n\n");
+        } else {
+            if (ToolCallCodec.looksLikeMissedCall(fullContent)) {
+                logBoth("Suspected missed tool call (unparsable, stream), returned as plain answer");
+            }
+            sb.append("data: ").append(buildChunk(completionId, fullContent, false)).append("\n\n");
+            sb.append("data: ").append(buildChunk(completionId, null, true)).append("\n\n");
+        }
+        sb.append("data: [DONE]\n\n");
 
         Response resp = new Response(200, "text/event-stream", sb.toString());
         resp.headers.put("Cache-Control", "no-cache");
@@ -640,8 +942,11 @@ public class OpenAIServer {
      *
      * @return 恒为 null —— 表示响应已由本方法直接写进 socket，调用方不得再写第二次
      */
-    private Response writeChunkedStreamResponse(OutputStream out, ConversationSession session, String requestId) {
+    private Response writeChunkedStreamResponse(OutputStream out, ConversationSession session,
+                                                String requestId, String format,
+                                                JSONObject request, boolean toolsRequest) {
         String completionId = "chatcmpl-" + requestId;
+        boolean anthropic = "anthropic".equals(format);
         long startTime = System.currentTimeMillis();
         int fragmentCount = 0;
 
@@ -653,19 +958,79 @@ public class OpenAIServer {
             head.append("Transfer-Encoding: chunked\r\n");
             head.append("Cache-Control: no-cache\r\n");
             head.append("Connection: keep-alive\r\n");
-            head.append("Access-Control-Allow-Origin: *\r\n");
-            head.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-            head.append("Access-Control-Allow-Headers: Content-Type, Authorization\r\n");
+            if (ConfigManager.isCorsEnabledInTarget()) {
+                head.append("Access-Control-Allow-Origin: *\r\n");
+                head.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+                head.append("Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, "
+                        + "anthropic-version\r\n");
+            }
             head.append("\r\n");
             out.write(head.toString().getBytes(StandardCharsets.UTF_8));
             out.flush();
             logBoth("Chunked stream headers sent for " + requestId);
 
+            // Anthropic 协议要求先发 message_start / content_block_start，
+            // 否则 SDK 解析首片 delta 时会因为缺少 message 容器而报错。
+            if (anthropic) {
+                writeChunk(out, anthropicEvent("message_start", requestId, null, null));
+                writeChunk(out, anthropicEvent("content_block_start", requestId, null, null));
+            }
+
+            if (toolsRequest) {
+                // 带工具时不能边收边发：整段回答收完之前无法判断这次是「调用工具」
+                // 还是「普通回答」，而两者的 finish_reason 与 delta 形状完全不同。
+                // 把调用块的 XML 原样流给客户端，对方会把它当正文渲染。
+                while (!session.isCompleted()
+                        && System.currentTimeMillis() - startTime < STREAM_TIMEOUT_MS) {
+                    try {
+                        Thread.sleep(POLL_GRANULARITY_MS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                String full = session.getFullContent();
+                JSONArray calls = ToolCallBridge.extractCalls(request, full);
+                if (calls.length() > 0) {
+                    logBoth("Tool calls parsed (chunked): " + calls.length()
+                            + ", names=" + ToolCallBridge.callNames(calls));
+                    String headText = ToolCallBridge.headText(full);
+                    if (!headText.isEmpty()) {
+                        writeChunk(out, "data: " + buildChunk(completionId, headText, false) + "\n\n");
+                    }
+                    writeChunk(out, "data: " + ToolCallBridge.buildToolCallsChunk(completionId, calls)
+                            + "\n\n");
+                    JSONObject fin = buildChunk(completionId, null, true);
+                    try {
+                        fin.getJSONArray("choices").getJSONObject(0)
+                                .put("finish_reason", "tool_calls");
+                    } catch (Exception ignored) {
+                    }
+                    writeChunk(out, "data: " + fin + "\n\n");
+                } else {
+                    if (ToolCallCodec.looksLikeMissedCall(full)) {
+                        logBoth("Suspected missed tool call (unparsable, chunked)");
+                    }
+                    if (!full.isEmpty()) {
+                        writeChunk(out, "data: " + buildChunk(completionId, full, false) + "\n\n");
+                    }
+                    writeChunk(out, "data: " + buildChunk(completionId, null, true) + "\n\n");
+                }
+                writeChunk(out, "data: [DONE]\n\n");
+                out.write("0\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+                out.flush();
+                logBoth("Tool-call chunked stream done for " + requestId
+                        + ", calls=" + calls.length()
+                        + ", cost=" + (System.currentTimeMillis() - startTime) + "ms");
+                return null;
+            }
+
             while (true) {
                 String content = session.pollContent(POLL_GRANULARITY_MS);
                 if (content != null) {
-                    String sse = "data: " + buildChunk(completionId, content, false) + "\n\n";
-                    writeChunk(out, sse);
+                    writeChunk(out, anthropic
+                            ? anthropicEvent("content_block_delta", requestId, content, null)
+                            : "data: " + buildChunk(completionId, content, false) + "\n\n");
                     fragmentCount++;
                     // 队列可能还有积压，本轮继续取，不再额外等待
                     continue;
@@ -675,11 +1040,19 @@ public class OpenAIServer {
                     // 收尾：把队列剩余内容全部取空，避免最后几个片段丢失
                     String remaining;
                     while ((remaining = session.pollContent(0)) != null) {
-                        writeChunk(out, "data: " + buildChunk(completionId, remaining, false) + "\n\n");
+                        writeChunk(out, anthropic
+                                ? anthropicEvent("content_block_delta", requestId, remaining, null)
+                                : "data: " + buildChunk(completionId, remaining, false) + "\n\n");
                         fragmentCount++;
                     }
-                    writeChunk(out, "data: " + buildChunk(completionId, null, true) + "\n\n");
-                    writeChunk(out, "data: [DONE]\n\n");
+                    if (anthropic) {
+                        writeChunk(out, anthropicEvent("content_block_stop", requestId, null, null));
+                        writeChunk(out, anthropicEvent("message_delta", requestId, null, "end_turn"));
+                        writeChunk(out, anthropicEvent("message_stop", requestId, null, null));
+                    } else {
+                        writeChunk(out, "data: " + buildChunk(completionId, null, true) + "\n\n");
+                        writeChunk(out, "data: [DONE]\n\n");
+                    }
                     // 终止块：零长度 chunk
                     out.write("0\r\n\r\n".getBytes(StandardCharsets.UTF_8));
                     out.flush();
@@ -690,9 +1063,14 @@ public class OpenAIServer {
 
                 if (System.currentTimeMillis() - startTime > STREAM_TIMEOUT_MS) {
                     // 超时不能只 break 走人：chunked 流没有终止块时客户端会一直挂等，
-                    // 必须把 [DONE] 与终止块补上，让客户端能正常结束。
+                    // 必须把结束事件与终止块补上，让客户端能正常结束。
                     logBoth("Chunked stream timeout for " + requestId + ", fragments=" + fragmentCount);
-                    writeChunk(out, "data: [DONE]\n\n");
+                    GatewayStats.countError("stream_timeout");
+                    if (anthropic) {
+                        writeChunk(out, anthropicEvent("message_stop", requestId, null, null));
+                    } else {
+                        writeChunk(out, "data: [DONE]\n\n");
+                    }
                     out.write("0\r\n\r\n".getBytes(StandardCharsets.UTF_8));
                     out.flush();
                     break;
@@ -700,9 +1078,55 @@ public class OpenAIServer {
             }
         } catch (IOException e) {
             // 客户端提前断开（Ctrl-C / 超时取消）会走到这里，属于常见情况，不升级为错误
+            GatewayStats.incrClientAborted();
             logBoth("Chunked stream aborted for " + requestId + ": " + e);
         }
         return null;
+    }
+
+    /**
+     * Anthropic SSE 事件编码。
+     *
+     * <p>Anthropic 的流式协议与 OpenAI 不同：每个事件是
+     * {@code event: <type>\ndata: <json>\n\n}，且 message 内容分散在
+     * message_start / content_block_delta / message_stop 等事件里。</p>
+     */
+    private String anthropicEvent(String type, String requestId, String text, String stopReason) {
+        try {
+            JSONObject data = new JSONObject();
+            data.put("type", type);
+
+            if ("message_start".equals(type)) {
+                JSONObject message = new JSONObject();
+                message.put("id", "msg_" + requestId);
+                message.put("type", "message");
+                message.put("role", "assistant");
+                message.put("model", "xiaobu");
+                message.put("content", new JSONArray());
+                message.put("stop_reason", JSONObject.NULL);
+                message.put("usage", new JSONObject()
+                        .put("input_tokens", 0).put("output_tokens", 0));
+                data.put("message", message);
+            } else if ("content_block_start".equals(type)) {
+                data.put("index", 0);
+                data.put("content_block", new JSONObject().put("type", "text").put("text", ""));
+            } else if ("content_block_delta".equals(type)) {
+                data.put("index", 0);
+                data.put("delta", new JSONObject()
+                        .put("type", "text_delta")
+                        .put("text", text == null ? "" : text));
+            } else if ("content_block_stop".equals(type)) {
+                data.put("index", 0);
+            } else if ("message_delta".equals(type)) {
+                data.put("delta", new JSONObject()
+                        .put("stop_reason", stopReason == null ? "end_turn" : stopReason));
+                data.put("usage", new JSONObject().put("output_tokens", 0));
+            }
+
+            return "event: " + type + "\ndata: " + data + "\n\n";
+        } catch (Throwable t) {
+            return "";
+        }
     }
 
     /**
@@ -719,11 +1143,14 @@ public class OpenAIServer {
         out.flush();
     }
 
-    private Response buildNonStreamResponse(ConversationSession session, String requestId) {
+    private Response buildNonStreamResponse(ConversationSession session, String requestId,
+                                            String format, JSONObject request,
+                                            boolean toolsRequest) {
         long startTime = System.currentTimeMillis();
         // If the session is already completed, skip waiting
         if (!session.isCompleted()) {
-            while (!session.isCompleted() && (System.currentTimeMillis() - startTime < STREAM_TIMEOUT_MS)) {
+            long deadline = startTime + ConfigManager.getRequestTimeoutMsInTarget();
+            while (!session.isCompleted() && System.currentTimeMillis() < deadline) {
                 try { Thread.sleep(100); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -732,43 +1159,128 @@ public class OpenAIServer {
         }
 
         String fullContent = session.getFullContent();
-        logBoth("Non-stream done, completed=" + session.isCompleted() + ", contentLen=" + fullContent.length());
+        logBoth("Non-stream done, format=" + format + ", completed=" + session.isCompleted()
+                + ", contentLen=" + fullContent.length());
         if (fullContent.isEmpty()) {
+            GatewayStats.countError("empty_content");
             return new Response(200, "application/json",
-                    "{\"error\":{\"message\":\"Timeout waiting for response\"}}");
+                    "{\"error\":{\"message\":\"Timeout waiting for response\","
+                            + "\"type\":\"upstream_error\"}}");
         }
 
         try {
-            JSONObject message = new JSONObject();
-            message.put("role", "assistant");
-            message.put("content", fullContent);
-
-            JSONObject choice = new JSONObject();
-            choice.put("index", 0);
-            choice.put("message", message);
-            choice.put("finish_reason", "stop");
-
-            JSONArray choices = new JSONArray();
-            choices.put(choice);
-
-            JSONObject usage = new JSONObject();
-            usage.put("prompt_tokens", 0);
-            usage.put("completion_tokens", fullContent.length());
-            usage.put("total_tokens", fullContent.length());
-
-            JSONObject result = new JSONObject();
-            result.put("id", "chatcmpl-" + requestId);
-            result.put("object", "chat.completion");
-            result.put("created", System.currentTimeMillis() / 1000);
-            result.put("model", "xiaobu");
-            result.put("choices", choices);
-            result.put("usage", usage);
-
-            return new Response(200, "application/json", result.toString());
+            // v3.8 工具调用：回答里有调用块时返回标准 tool_calls 契约。
+            // 只对 OpenAI 格式生效（见 handleChatCompletions 的说明）。
+            if (toolsRequest && !"anthropic".equals(format) && !"legacy".equals(format)) {
+                JSONArray calls = ToolCallBridge.extractCalls(request, fullContent);
+                if (calls.length() > 0) {
+                    logBoth("Tool calls parsed: " + calls.length()
+                            + ", names=" + ToolCallBridge.callNames(calls));
+                    return new Response(200, "application/json",
+                            ToolCallBridge.openAiToolCallsCompletion(requestId, fullContent, calls));
+                }
+                if (ToolCallCodec.looksLikeMissedCall(fullContent)) {
+                    // 模型想调但格式跑偏且兜底也没捞到完整参数：记日志便于定位，
+                    // 不自动重试（实测遵循率极高，重试的代价大于收益）。
+                    logBoth("Suspected missed tool call (unparsable), returned as plain answer");
+                }
+            }
+            if ("anthropic".equals(format)) {
+                return new Response(200, "application/json",
+                        anthropicMessage(requestId, fullContent));
+            }
+            if ("legacy".equals(format)) {
+                return new Response(200, "application/json",
+                        legacyCompletion(requestId, fullContent));
+            }
+            return new Response(200, "application/json",
+                    openAiCompletion(requestId, fullContent));
         } catch (Exception e) {
+            GatewayStats.countError("serialize");
             logBoth("Non-stream error: " + e.getMessage());
-            return new Response(500, "application/json", "{\"error\":{\"message\":\"Internal Error\"}}");
+            return new Response(500, "application/json",
+                    "{\"error\":{\"message\":\"Internal Error\",\"type\":\"api_error\"}}");
         }
+    }
+
+    /** OpenAI /v1/chat/completions 响应体 */
+    private String openAiCompletion(String requestId, String content) throws Exception {
+        JSONObject message = new JSONObject();
+        message.put("role", "assistant");
+        message.put("content", content);
+
+        JSONObject choice = new JSONObject();
+        choice.put("index", 0);
+        choice.put("message", message);
+        choice.put("finish_reason", "stop");
+
+        JSONArray choices = new JSONArray();
+        choices.put(choice);
+
+        JSONObject usage = new JSONObject();
+        usage.put("prompt_tokens", 0);
+        usage.put("completion_tokens", content.length());
+        usage.put("total_tokens", content.length());
+
+        JSONObject result = new JSONObject();
+        result.put("id", "chatcmpl-" + requestId);
+        result.put("object", "chat.completion");
+        result.put("created", System.currentTimeMillis() / 1000);
+        result.put("model", "xiaobu");
+        result.put("choices", choices);
+        result.put("usage", usage);
+        return result.toString();
+    }
+
+    /** Anthropic /v1/messages 非流式响应体 */
+    private String anthropicMessage(String requestId, String content) throws Exception {
+        JSONObject textBlock = new JSONObject();
+        textBlock.put("type", "text");
+        textBlock.put("text", content);
+
+        JSONArray blocks = new JSONArray();
+        blocks.put(textBlock);
+
+        JSONObject usage = new JSONObject();
+        usage.put("input_tokens", 0);
+        usage.put("output_tokens", content.length());
+
+        JSONObject result = new JSONObject();
+        result.put("id", "msg_" + requestId);
+        result.put("type", "message");
+        result.put("role", "assistant");
+        result.put("model", "xiaobu");
+        result.put("content", blocks);
+        result.put("stop_reason", "end_turn");
+        result.put("stop_sequence", JSONObject.NULL);
+        result.put("usage", usage);
+        return result.toString();
+    }
+
+    /** Legacy /v1/completions 响应体（text 数组，非 choices/message） */
+    private String legacyCompletion(String requestId, String content) throws Exception {
+        JSONObject choice = new JSONObject();
+        choice.put("text", content);
+        choice.put("index", 0);
+        choice.put("logprobs", JSONObject.NULL);
+        choice.put("finish_reason", "stop");
+
+        JSONArray choices = new JSONArray();
+        choices.put(choice);
+
+        JSONObject usage = new JSONObject();
+        usage.put("prompt_tokens", 0);
+        usage.put("completion_tokens", content.length());
+        usage.put("total_tokens", content.length());
+
+        JSONObject result = new JSONObject();
+        result.put("id", "cmpl-" + requestId);
+        result.put("object", "text_completion");
+        result.put("created", System.currentTimeMillis() / 1000);
+        result.put("model", "xiaobu");
+        result.put("choices", choices);
+        result.put("usage", usage);
+        return result.toString();
     }
 
     private JSONObject buildChunk(String id, String content, boolean finished) {
@@ -801,7 +1313,25 @@ public class OpenAIServer {
             JSONArray messages = request.getJSONArray("messages");
             for (int i = messages.length() - 1; i >= 0; i--) {
                 JSONObject msg = messages.getJSONObject(i);
-                if ("user".equals(msg.optString("role"))) return msg.optString("content", null);
+                if (!"user".equals(msg.optString("role"))) continue;
+
+                // content 可能是字符串，也可能是 Anthropic 风格的内容块数组
+                Object content = msg.opt("content");
+                if (content instanceof String) {
+                    return (String) content;
+                }
+                if (content instanceof JSONArray) {
+                    StringBuilder sb = new StringBuilder();
+                    JSONArray blocks = (JSONArray) content;
+                    for (int j = 0; j < blocks.length(); j++) {
+                        JSONObject block = blocks.optJSONObject(j);
+                        if (block == null) continue;
+                        if ("text".equals(block.optString("type"))) {
+                            sb.append(block.optString("text", ""));
+                        }
+                    }
+                    if (sb.length() > 0) return sb.toString();
+                }
             }
         } catch (Exception e) {
             logBoth("extractLastUserMessage failed: " + e.getMessage());
@@ -809,10 +1339,15 @@ public class OpenAIServer {
         return null;
     }
 
+    /** CORS 响应头：受设置页开关控制（对应参照物的「CORS 允许跨域」） */
     private void addCorsHeaders(Response resp) {
+        if (!ConfigManager.isCorsEnabledInTarget()) {
+            return;
+        }
         resp.headers.put("Access-Control-Allow-Origin", "*");
         resp.headers.put("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        resp.headers.put("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        resp.headers.put("Access-Control-Allow-Headers",
+                "Content-Type, Authorization, x-api-key, anthropic-version");
     }
 
     private void sendResponse(OutputStream out, int code, String contentType, String body) throws IOException {
@@ -841,15 +1376,22 @@ public class OpenAIServer {
      * "HTTP/1.1 429 OK"，语义自相矛盾，部分 HTTP 客户端与网关会据此误判。
      */
     private static String reasonPhrase(int code) {
+        // 旧实现把状态行硬编码成 "200 OK"，限流返回 429 时会写出
+        // "HTTP/1.1 429 OK"，语义自相矛盾，部分 HTTP 客户端与网关会据此误判。
         switch (code) {
             case 200: return "OK";
             case 204: return "No Content";
             case 400: return "Bad Request";
             case 401: return "Unauthorized";
+            case 403: return "Forbidden";
             case 404: return "Not Found";
+            case 405: return "Method Not Allowed";
+            case 422: return "Unprocessable Entity";
             case 429: return "Too Many Requests";
-            case 503: return "Service Unavailable";
             case 500: return "Internal Server Error";
+            case 502: return "Bad Gateway";
+            case 503: return "Service Unavailable";
+            case 504: return "Gateway Timeout";
             default:  return "Unknown";
         }
     }

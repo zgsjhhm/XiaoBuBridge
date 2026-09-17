@@ -18,8 +18,12 @@ android {
         // 首个正式版本：v3.0
         // versionCode 采用 major*10000 + minor*100 + patch 编码，保证严格递增，
         // 且与 versionName 一一对应（3.0 -> 30000、3.0.1 -> 30001、3.1 -> 30100）。
-        versionCode = 30000
-        versionName = "3.0"
+        // v3.7：复刻参照物 UI（顶栏 + 底部导航 + 卡片体系）并补齐
+        //       Anthropic / legacy 端点、CORS 开关、自动重试、运行统计。
+        // v3.8：工具调用层内嵌（XML 协议注入 + 解析校正 + 预算裁剪 + tool_calls 契约），
+        //       由 ToolCallPrompt / ToolCallCodec / ToolCallBridge 承担。
+        versionCode = 30800
+        versionName = "3.8"
     }
 
     buildTypes {

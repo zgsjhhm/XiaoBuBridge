@@ -52,6 +52,19 @@ public final class ConfigManager {
     /** v3.6 真流式：HTTP 层 chunked 分片 flush，客户端可边收边显 */
     public static final String KEY_CHUNKED_STREAM_ENABLED = "chunked_stream_enabled";
 
+    // ---- v3.7 网关能力（对齐参照物 Qwen AppHook 的 ControlSurface） ----
+
+    /** API 格式：openai（/v1/chat/completions）| anthropic（/v1/messages）| both */
+    public static final String KEY_API_FORMAT = "api_format";
+    /** 是否下发 Access-Control-Allow-* 跨域响应头 */
+    public static final String KEY_CORS_ENABLED = "cors_enabled";
+    /** 注入后零回调时是否自动重试 */
+    public static final String KEY_AUTO_RETRY_ENABLED = "auto_retry_enabled";
+    /** 自动重试次数上限 */
+    public static final String KEY_AUTO_RETRY_MAX = "auto_retry_max";
+    /** 单次请求等待回答的超时（毫秒） */
+    public static final String KEY_REQUEST_TIMEOUT_MS = "request_timeout_ms";
+
     // ==================== 默认值 ====================
 
     public static final boolean DEFAULT_SERVER_ENABLED = true;
@@ -70,6 +83,23 @@ public final class ConfigManager {
     public static final boolean DEFAULT_KEEP_ALIVE_ENABLED = false;
     /** v3.6 真流式默认开启 */
     public static final boolean DEFAULT_CHUNKED_STREAM_ENABLED = true;
+
+    /** v3.7 默认同时开放 OpenAI 之外的兼容格式（照参照物 both 行为） */
+    public static final String API_FORMAT_OPENAI = "openai";
+    public static final String API_FORMAT_ANTHROPIC = "anthropic";
+    public static final String API_FORMAT_BOTH = "both";
+    public static final String DEFAULT_API_FORMAT = API_FORMAT_BOTH;
+    /** v3.7 默认允许跨域：本地调试时浏览器直连需要它 */
+    public static final boolean DEFAULT_CORS_ENABLED = true;
+    /** v3.7 默认开启自动重试：注入零回调是概率事件，重试一次能显著提高成功率 */
+    public static final boolean DEFAULT_AUTO_RETRY_ENABLED = true;
+    public static final int DEFAULT_AUTO_RETRY_MAX = 1;
+    public static final int MIN_AUTO_RETRY_MAX = 0;
+    public static final int MAX_AUTO_RETRY_MAX = 5;
+    /** v3.7 默认单次请求等待上限：与旧版 waitForActiveSession 的 240*250ms 对齐 */
+    public static final int DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+    public static final int MIN_REQUEST_TIMEOUT_MS = 10000;
+    public static final int MAX_REQUEST_TIMEOUT_MS = 300000;
 
     /** 端口合法区间（避开特权端口） */
     public static final int MIN_PORT = 1024;
@@ -95,6 +125,43 @@ public final class ConfigManager {
         if (value > MAX_CONCURRENCY) return MAX_CONCURRENCY;
         return value;
     }
+
+    /** 重试次数越界时收敛 */
+    public static int clampAutoRetryMax(int value) {
+        if (value < MIN_AUTO_RETRY_MAX) return MIN_AUTO_RETRY_MAX;
+        if (value > MAX_AUTO_RETRY_MAX) return MAX_AUTO_RETRY_MAX;
+        return value;
+    }
+
+    /** 请求超时越界时收敛 */
+    public static int clampRequestTimeoutMs(int value) {
+        if (value < MIN_REQUEST_TIMEOUT_MS) return MIN_REQUEST_TIMEOUT_MS;
+        if (value > MAX_REQUEST_TIMEOUT_MS) return MAX_REQUEST_TIMEOUT_MS;
+        return value;
+    }
+
+    /** API 格式只接受白名单值，其余一律回退默认（避免 UI 侧写入脏值导致路由失效） */
+    public static String normalizeApiFormat(String raw) {
+        if (API_FORMAT_OPENAI.equals(raw) || API_FORMAT_ANTHROPIC.equals(raw)
+                || API_FORMAT_BOTH.equals(raw)) {
+            return raw;
+        }
+        return DEFAULT_API_FORMAT;
+    }
+
+    /**
+     * 全部配置键。
+     *
+     * <p>供两处使用：设置页展示条目数；{@code ConfigProvider} 全量导出路径
+     * 做白名单校验。</p>
+     */
+    public static final String[] ALL_KEYS = new String[]{
+            KEY_SERVER_ENABLED, KEY_PORT, KEY_API_KEY_ENABLED, KEY_API_KEY,
+            KEY_LOG_LEVEL, KEY_STREAM_ENABLED, KEY_SYSTEM_PROMPT, KEY_MAX_CONCURRENCY,
+            KEY_FLOAT_BALL_ENABLED, KEY_AUTO_WAKE_ENABLED, KEY_KEEP_ALIVE_ENABLED,
+            KEY_CHUNKED_STREAM_ENABLED, KEY_API_FORMAT, KEY_CORS_ENABLED,
+            KEY_AUTO_RETRY_ENABLED, KEY_AUTO_RETRY_MAX, KEY_REQUEST_TIMEOUT_MS,
+    };
 
     // ==================== UI 侧（模块进程） ====================
 
@@ -207,6 +274,49 @@ public final class ConfigManager {
         prefs(ctx).edit().putBoolean(KEY_CHUNKED_STREAM_ENABLED, enabled).apply();
     }
 
+    // ==================== v3.7 网关能力配置（UI 侧） ====================
+
+    public static String getApiFormat(Context ctx) {
+        return normalizeApiFormat(prefs(ctx).getString(KEY_API_FORMAT, DEFAULT_API_FORMAT));
+    }
+
+    public static void setApiFormat(Context ctx, String format) {
+        prefs(ctx).edit().putString(KEY_API_FORMAT, normalizeApiFormat(format)).apply();
+    }
+
+    public static boolean isCorsEnabled(Context ctx) {
+        return prefs(ctx).getBoolean(KEY_CORS_ENABLED, DEFAULT_CORS_ENABLED);
+    }
+
+    public static void setCorsEnabled(Context ctx, boolean enabled) {
+        prefs(ctx).edit().putBoolean(KEY_CORS_ENABLED, enabled).apply();
+    }
+
+    public static boolean isAutoRetryEnabled(Context ctx) {
+        return prefs(ctx).getBoolean(KEY_AUTO_RETRY_ENABLED, DEFAULT_AUTO_RETRY_ENABLED);
+    }
+
+    public static void setAutoRetryEnabled(Context ctx, boolean enabled) {
+        prefs(ctx).edit().putBoolean(KEY_AUTO_RETRY_ENABLED, enabled).apply();
+    }
+
+    public static int getAutoRetryMax(Context ctx) {
+        return clampAutoRetryMax(prefs(ctx).getInt(KEY_AUTO_RETRY_MAX, DEFAULT_AUTO_RETRY_MAX));
+    }
+
+    public static void setAutoRetryMax(Context ctx, int value) {
+        prefs(ctx).edit().putInt(KEY_AUTO_RETRY_MAX, clampAutoRetryMax(value)).apply();
+    }
+
+    public static int getRequestTimeoutMs(Context ctx) {
+        return clampRequestTimeoutMs(
+                prefs(ctx).getInt(KEY_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS));
+    }
+
+    public static void setRequestTimeoutMs(Context ctx, int value) {
+        prefs(ctx).edit().putInt(KEY_REQUEST_TIMEOUT_MS, clampRequestTimeoutMs(value)).apply();
+    }
+
     // ==================== Hook 侧（小布进程） ====================
 
     /** 目标 App 进程内的 Context；Xposed 框架注入，失败返回 null */
@@ -311,36 +421,74 @@ public final class ConfigManager {
         return getBooleanInTarget(KEY_CHUNKED_STREAM_ENABLED, DEFAULT_CHUNKED_STREAM_ENABLED);
     }
 
+    // ==================== v3.7 网关能力配置（Hook 侧） ====================
+
+    public static String getApiFormatInTarget() {
+        return normalizeApiFormat(getStringInTarget(KEY_API_FORMAT, DEFAULT_API_FORMAT));
+    }
+
+    public static boolean isCorsEnabledInTarget() {
+        return getBooleanInTarget(KEY_CORS_ENABLED, DEFAULT_CORS_ENABLED);
+    }
+
+    public static boolean isAutoRetryEnabledInTarget() {
+        return getBooleanInTarget(KEY_AUTO_RETRY_ENABLED, DEFAULT_AUTO_RETRY_ENABLED);
+    }
+
+    public static int getAutoRetryMaxInTarget() {
+        String raw = getStringInTarget(KEY_AUTO_RETRY_MAX, String.valueOf(DEFAULT_AUTO_RETRY_MAX));
+        try {
+            return clampAutoRetryMax(Integer.parseInt(raw.trim()));
+        } catch (Throwable t) {
+            return DEFAULT_AUTO_RETRY_MAX;
+        }
+    }
+
+    public static int getRequestTimeoutMsInTarget() {
+        String raw = getStringInTarget(KEY_REQUEST_TIMEOUT_MS,
+                String.valueOf(DEFAULT_REQUEST_TIMEOUT_MS));
+        try {
+            return clampRequestTimeoutMs(Integer.parseInt(raw.trim()));
+        } catch (Throwable t) {
+            return DEFAULT_REQUEST_TIMEOUT_MS;
+        }
+    }
+
     /**
-     * 在 Hook 侧（目标 App 进程）写入浮球开关配置。
-     * 通过 ContentResolver 调用模块导出的 ConfigProvider。
+     * Hook 侧写入一项配置：通过 ContentResolver 写回模块进程的 ConfigProvider。
+     *
+     * <p>失败时只记日志，<b>不</b>回退到 {@code AndroidAppHelper.currentApplication()}
+     * —— 那个 Context 在小布进程里指向的是小布自己，用它的 SharedPreferences
+     * 写模块的键等于写进小布的私有目录，模块永远读不到，只会用「成功」的假象
+     * 掩盖真实的写入失败。</p>
+     *
+     * @return 是否写入成功
      */
-    public static void setFloatBallEnabledInTarget(boolean enabled) {
+    public static boolean setStringInTarget(String key, String value) {
         Context ctx = targetContext();
         if (ctx == null) {
-            XposedBridge.log(TAG + " setFloatBallEnabledInTarget: target context is null");
-            return;
+            XposedBridge.log(TAG + " setStringInTarget(" + key + "): target context is null");
+            return false;
         }
         try {
-            Uri uri = BASE_URI.buildUpon().appendPath(KEY_FLOAT_BALL_ENABLED).build();
+            Uri uri = BASE_URI.buildUpon().appendPath(key).build();
             ContentValues values = new ContentValues();
-            values.put("value", String.valueOf(enabled));
+            values.put("value", value == null ? "" : value);
             ctx.getContentResolver().insert(uri, values);
-            XposedBridge.log(TAG + " setFloatBallEnabledInTarget(" + enabled + ") via ContentProvider");
+            return true;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " setFloatBallEnabledInTarget failed: " + t);
-
-            // Fallback: 直接写入 ContentProvider 的 SharedPreferences
-            // 这种方式只在模块进程中有效
-            try {
-                Context moduleCtx = AndroidAppHelper.currentApplication();
-                if (moduleCtx != null) {
-                    prefs(moduleCtx).edit().putBoolean(KEY_FLOAT_BALL_ENABLED, enabled).apply();
-                    XposedBridge.log(TAG + " setFloatBallEnabledInTarget: fallback to direct prefs write");
-                }
-            } catch (Throwable t2) {
-                XposedBridge.log(TAG + " setFloatBallEnabledInTarget fallback failed: " + t2);
-            }
+            XposedBridge.log(TAG + " setStringInTarget(" + key + "=" + value + ") failed: " + t);
+            return false;
         }
+    }
+
+    /** Hook 侧写入布尔配置 */
+    public static boolean setBooleanInTarget(String key, boolean value) {
+        return setStringInTarget(key, String.valueOf(value));
+    }
+
+    /** Hook 侧写入浮球开关（供控制面板的「隐藏悬浮球」调用） */
+    public static boolean setFloatBallEnabledInTarget(boolean enabled) {
+        return setBooleanInTarget(KEY_FLOAT_BALL_ENABLED, enabled);
     }
 }

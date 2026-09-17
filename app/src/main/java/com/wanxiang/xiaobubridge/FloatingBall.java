@@ -87,29 +87,30 @@ public class FloatingBall {
         Resources res = ctx.getResources();
         float density = res.getDisplayMetrics().density;
 
-        int size = Math.round(56 * density); // 56dp
+        int size = Math.round(48 * density); // 48dp —— 与参照物一致
 
         // 创建悬浮球容器
         FrameLayout ballContainer = new FrameLayout(ctx);
         ballContainer.setTag(BALL_TAG);
 
-        // 背景 drawable：圆角
+        // 背景：近黑圆面 + 主色描边，取值照搬参照物的 FloatingBall 规格
+        // （#EE1F2937 填充 / #3B82F6 描边，与 UIKit.ACCENT 同色）
         GradientDrawable bg = new GradientDrawable();
         bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(0xFF2A2A2A); // 深灰色
+        bg.setColor(0xEE1F2937);
         int strokePx = Math.round(2 * density);
-        bg.setStroke(strokePx, 0xFF3985FF); // 蓝色边框
+        bg.setStroke(strokePx, UIKit.ACCENT);
         ballContainer.setBackground(bg);
 
-        // 电梯
-        ballContainer.setElevation(8 * density);
+        // 悬浮球抬升到面板之上
+        ballContainer.setElevation(12 * density);
         ballContainer.setClipToPadding(false);
 
         // gear icon TextView
         TextView gearIcon = new TextView(ctx);
-        gearIcon.setText("\u2699"); // \u2699 = \u2699
+        gearIcon.setText("\u2699"); // \u2699 = 齿轮
         gearIcon.setTextSize(20);
-        gearIcon.setTextColor(0xFFE0E0E0);
+        gearIcon.setTextColor(0xFF93C5FD); // 参照物的浅蓝前景
         gearIcon.setGravity(Gravity.CENTER);
         gearIcon.setLayoutParams(new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -120,13 +121,13 @@ public class FloatingBall {
         View dotView = new View(ctx);
         GradientDrawable dotBg = new GradientDrawable();
         dotBg.setShape(GradientDrawable.OVAL);
-        dotBg.setColor(0xFF888888); // 灰色=空闲
+        dotBg.setColor(0xFF6B7280); // 灰=空闲
         dotView.setBackground(dotBg);
         FrameLayout.LayoutParams dotLp = new FrameLayout.LayoutParams(
                 Math.round(8 * density), Math.round(8 * density));
         dotLp.gravity = Gravity.END | Gravity.TOP;
-        dotLp.setMarginEnd(Math.round(4 * density));
-        dotLp.topMargin = Math.round(4 * density);
+        dotLp.setMarginEnd(Math.round(3 * density));
+        dotLp.topMargin = Math.round(3 * density);
         dotView.setLayoutParams(dotLp);
         ballContainer.addView(dotView);
 
@@ -313,7 +314,7 @@ public class FloatingBall {
             // 检查是否有活跃的会话
             ConversationSession session = ConversationSession.getMostRecent(0);
             boolean active = session != null && !session.isCompleted();
-            int color = active ? 0xFF00C853 : 0xFF888888; // 绿色=活跃，灰色=空闲
+            int color = active ? UIKit.GREEN : 0xFF6B7280; // 绿=活跃，灰=空闲
             if (dot != null && dot.getBackground() instanceof GradientDrawable) {
                 ((GradientDrawable) dot.getBackground()).setColor(color);
             }

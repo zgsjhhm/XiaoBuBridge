@@ -26,6 +26,15 @@ resources.arsc
 classes*.dex
 kotlin/
 DebugProbesKt.bin
+# 以下仅匹配仓库根目录：项目真实资源在 app/src/main/ 下
+/AndroidManifest.xml
+/assets/
+/res/
+/lib/
+/org/
+/io/
+/com/
+/google/
 
 # ---- IDE ----
 .idea/
