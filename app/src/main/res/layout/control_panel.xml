@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FloatingPanel 控制面板布局。
+  外层 FrameLayout（id=control_panel_content）作为点击外部区域容器，
+  内部 LinearLayout 承载面板内容。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/control_panel_content"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:foreground="?android:attr/selectableItemBackground">
+
+    <!-- 面板背景容器 -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end|top"
+        android:layout_marginTop="80dp"
+        android:layout_marginEnd="16dp"
+        android:orientation="vertical"
+        android:background="@drawable/control_panel_background"
+        android:padding="16dp"
+        android:elevation="8dp">
+
+        <!-- 标题 -->
+        <TextView
+            android:id="@+id/tv_control_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="XiaoBu Bridge"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:paddingBottom="12dp" />
+
+        <!-- 状态详情 -->
+        <TextView
+            android:id="@+id/tv_status_detail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textColor="#CCCCCC"
+            android:textSize="12sp"
+            android:paddingBottom="8dp"
+            android:visibility="gone" />
+
+        <!-- 刷新状态按钮 -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_refresh_status"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="刷新状态"
+            android:textColorHint="#FFFFFF"
+            android:strokeColor="#FFFFFFFF" />
+
+        <!-- 打开设置按钮 -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_open_settings"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="打开设置"
+            android:textColorHint="#FFFFFF"
+            android:strokeColor="#FFFFFFFF" />
+
+        <!-- 复制 API 地址按钮 -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_copy_address"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="复制 API 地址"
+            android:textColorHint="#FFFFFF"
+            android:strokeColor="#FFFFFFFF" />
+
+        <!-- 隐藏悬浮球按钮 -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_hide_float_ball"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="4dp"
+            android:text="关闭悬浮球"
+            android:textColorHint="#FFFFFF"
+            android:strokeColor="#FFFFFFFF" />
+
+    </LinearLayout>
+
+</FrameLayout>

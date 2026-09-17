@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 包名由 app/build.gradle.kts 的 namespace 提供；
+     AGP 8 起不再支持在此声明 package 属性（会被忽略并告警）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- v2.0 配置面板 + 网络监听 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- v3.0 悬浮球改为应用内悬浮（Hook decorView），无需 SYSTEM_ALERT_WINDOW 权限 -->
+
+    <!-- Android 11(API 30) 起启用包可见性过滤：未在此声明的包，
+         PackageManager.getPackageInfo() 会抛 NameNotFoundException。
+         之前状态页误报"未检测到 LSPosed 管理器"就是因为它。
+         这里只声明查询意图，不申请 QUERY_ALL_PACKAGES 这类宽泛权限。 -->
+    <queries>
+        <package android:name="org.lsposed.manager" />
+        <package android:name="com.heytap.speechassist" />
+    </queries>
+
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="XiaoBu Bridge"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.XiaoBuBridge"
+        android:usesCleartextTraffic="true">
+
+        <!-- v2.0 配置面板入口 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="XiaoBu Bridge">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- v2.0 AIDL 配置服务（模块进程内，仅本应用可绑定） -->
+        <service
+            android:name=".ConfigService"
+            android:exported="false" />
+
+        <!-- v3.0 悬浮球改为应用内悬浮（Hook Activity.onResume），无需 Service -->
+
+        <!-- v2.0 跨应用只读配置通道：小布进程通过 ContentResolver 读取配置。
+             必须 exported=true 才能被 com.heytap.speechassist 访问；
+             调用方白名单校验在 ConfigProvider 内部完成。 -->
+        <provider
+            android:name=".ConfigProvider"
+            android:authorities="com.wanxiang.xiaobubridge.config"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- Xposed Module Metadata -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="将小布助手 AI 对话封装为 OpenAI 兼容本地 API（v3.0 悬浮球控制面板）" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+    </application>
+
+</manifest>
