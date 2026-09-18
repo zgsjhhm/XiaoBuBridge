@@ -71,11 +71,14 @@ final class Pages {
         private final TextView tvAuth;
         private final TextView tvActive;
         private final TextView tvRequests;
+        private final TextView tvToolCalls;
+        private final TextView tvLastTools;
         private final TextView tvFailed;
         private final TextView tvLatency;
         private final TextView tvRetries;
         private final TextView tvSystemPrompt;
         private final TextView tvConcurrency;
+        private final TextView tvHeartbeat;
 
         HomePage(Context ctx, Actions actions) {
             LinearLayout page = LinearLayoutHolder.create(ctx);
@@ -127,12 +130,15 @@ final class Pages {
             UIKit.divider(statusCard, ctx);
             tvActive = UIKit.infoRow(statusCard, ctx, "活跃连接", "—");
             tvRequests = UIKit.infoRow(statusCard, ctx, "累计请求", "—");
+            tvToolCalls = UIKit.infoRow(statusCard, ctx, "工具调用请求", "—");
+            tvLastTools = UIKit.infoRow(statusCard, ctx, "最近调用", "—");
             tvFailed = UIKit.infoRow(statusCard, ctx, "失败请求", "—");
             tvLatency = UIKit.infoRow(statusCard, ctx, "平均耗时", "—");
             tvRetries = UIKit.infoRow(statusCard, ctx, "自动重试", "—");
             UIKit.divider(statusCard, ctx);
             tvSystemPrompt = UIKit.infoRow(statusCard, ctx, "系统提示", "—");
             tvConcurrency = UIKit.infoRow(statusCard, ctx, "并发上限", "—");
+            tvHeartbeat = UIKit.infoRow(statusCard, ctx, "心跳保活", "—");
             page.addView(statusCard);
 
             // ---------- 操作 ----------
@@ -186,15 +192,31 @@ final class Pages {
                 tvAddress.setText("（小布未启动）");
             }
 
+            // 网关不通时统计行一律显示「—」。旧实现无条件赋值，于是「小布被杀」
+            // 之后面板仍显示上一轮的数字，看起来像网关还在跑 —— 运行状态卡片
+            // 只要有一个数字是陈旧的，整张卡片就不可信了。
+            boolean live = probe.alive;
+
             tvApiFormat.setText(apiFormatLabel(probe.apiFormat));
             tvAuth.setText(probe.apiKeySet ? "已开启 API Key" : "未开启");
-            tvActive.setText(String.valueOf(probe.activeConnections));
-            tvRequests.setText(String.valueOf(probe.requests));
-            tvFailed.setText(String.valueOf(probe.failed));
-            tvLatency.setText(probe.requests > 0 ? probe.avgLatencyMs + " ms" : "—");
-            tvRetries.setText(String.valueOf(probe.autoRetries));
+            tvActive.setText(live ? String.valueOf(probe.activeConnections) : "—");
+            tvRequests.setText(live ? String.valueOf(probe.requests) : "—");
+            // 工具调用请求：只有带 tools 的请求才计入，后面跟的是真正回吐的调用数。
+            // 两个数放在一起才有诊断价值 —— 「5 次 / 0 调用」说明请求确实带了 tools
+            // 但模型没按协议吐调用块，而不是「没人用工具调用」。
+            tvToolCalls.setText(live
+                    ? (probe.toolRequests + " 次 / " + probe.toolCalls + " 调用") : "—");
+            tvLastTools.setText(live && !probe.lastToolNames.isEmpty()
+                    ? probe.lastToolNames : "—");
+            tvFailed.setText(live ? String.valueOf(probe.failed) : "—");
+            tvLatency.setText(live && probe.requests > 0 ? probe.avgLatencyMs + " ms" : "—");
+            tvRetries.setText(live ? String.valueOf(probe.autoRetries) : "—");
             tvSystemPrompt.setText(probe.systemPromptSet ? "已设置" : "未设置");
             tvConcurrency.setText(String.valueOf(probe.maxConcurrency));
+            tvHeartbeat.setText(probe.heartbeatEnabled
+                    ? ("运行中（" + (probe.heartbeatIntervalMs / 1000) + "s/次，"
+                        + probe.heartbeatTicks + " 次）")
+                    : "已关闭");
 
             // 设备信息在本模块进程里读取，与 Hook 侧无关，页面构建时已填好；
             // 这里只在首次渲染时兜底一次，避免为空。
@@ -215,7 +237,8 @@ final class Pages {
         private final SwitchMaterial swChunked;
         private final SwitchMaterial swAutoWake;
         private final SwitchMaterial swKeepAlive;
-        private final SwitchMaterial swFloatBall;
+        private final SwitchMaterial swOverlayBall;
+        private final SwitchMaterial swHeartbeat;
         private final SwitchMaterial swApiKey;
         private final SwitchMaterial swCors;
         private final SwitchMaterial swAutoRetry;
@@ -223,6 +246,7 @@ final class Pages {
         private final EditText etConcurrency;
         private final EditText etRetryMax;
         private final EditText etTimeout;
+        private final EditText etHeartbeatInterval;
         private final EditText etApiKey;
         private final EditText etSystemPrompt;
         private final Spinner spLogLevel;
@@ -260,6 +284,33 @@ final class Pages {
                             + "-" + ConfigManager.MAX_REQUEST_TIMEOUT_MS + "）",
                     null, InputType.TYPE_CLASS_NUMBER, false);
             page.addView(svc);
+
+            // ---------- 保活与悬浮球 ----------
+            LinearLayout alive = UIKit.card(ctx);
+            alive.addView(UIKit.sectionTitle(ctx, "保活与悬浮球"));
+
+            swHeartbeat = UIKit.switchRow(alive, ctx, "心跳保活",
+                    "周期性探活网关，失联时自动重启监听；同时拦截小布自动退出",
+                    ConfigManager.DEFAULT_HEARTBEAT_ENABLED);
+            etHeartbeatInterval = UIKit.inputRow(alive, ctx,
+                    "心跳间隔（毫秒，" + ConfigManager.MIN_HEARTBEAT_INTERVAL_MS
+                            + "-" + ConfigManager.MAX_HEARTBEAT_INTERVAL_MS + "）",
+                    null, InputType.TYPE_CLASS_NUMBER, false);
+
+            swOverlayBall = UIKit.switchRow(alive, ctx, "系统悬浮球（需悬浮窗权限）",
+                    "任何界面都能点开：网关开关 / API Key / 心跳保活",
+                    ConfigManager.DEFAULT_OVERLAY_BALL_ENABLED);
+
+            alive.addView(UIKit.outlineButton(ctx, "授予悬浮窗权限 / 检查系统设置",
+                    v -> actions.onRequestOverlayPermission()),
+                    UIKit.matchWrap(ctx, 8f));
+            alive.addView(UIKit.outlineButton(ctx, "立即启停悬浮球服务",
+                    v -> actions.onApplyOverlayBall()),
+                    UIKit.matchWrap(ctx, 6f));
+            UIKit.hint(alive, ctx,
+                    "系统悬浮球由常驻前台服务持有，会显示一条最低优先级的常驻通知。"
+                            + "关闭开关会一并停止服务与通知。", 6);
+            page.addView(alive);
 
             // ---------- API 格式 / 兼容性 ----------
             LinearLayout api = UIKit.card(ctx);
@@ -314,18 +365,39 @@ final class Pages {
             swApiKey = UIKit.switchRow(key, ctx, "启用 API Key 鉴权",
                     "开启后请求需带 Authorization: Bearer <key>",
                     ConfigManager.DEFAULT_API_KEY_ENABLED);
-            etApiKey = UIKit.inputRow(key, ctx, "API Key", null, 0, false);
+            etApiKey = UIKit.inputRow(key, ctx, "API Key（点下方按钮可生成/复制）", null, 0, false);
+
+            LinearLayout keyActions = new LinearLayout(ctx);
+            keyActions.setOrientation(LinearLayout.HORIZONTAL);
+            keyActions.setPadding(0, UIKit.dp(ctx, 8), 0, 0);
+            keyActions.addView(UIKit.outlineButton(ctx, "生成新密钥",
+                            v -> actions.onGenerateApiKey()),
+                    new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            LinearLayout.LayoutParams copyKeyLp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            copyKeyLp.leftMargin = UIKit.dp(ctx, 8);
+            keyActions.addView(UIKit.outlineButton(ctx, "复制密钥",
+                            v -> actions.onCopyApiKey()),
+                    copyKeyLp);
+            key.addView(keyActions, UIKit.matchWrap(ctx, 0f));
+            UIKit.hint(key, ctx,
+                    "「生成新密钥」会同时开启鉴权开关并立即落盘——生成密钥的唯一目的就是用它，"
+                            + "不顺手开启只会让人以为没生效。", 4);
+
+            UIKit.divider(key, ctx);
             etSystemPrompt = UIKit.inputRow(key, ctx,
                     "系统提示（拼接到用户消息前，可留空）", null, 0, true);
+            // 导入走「读进输入框、再点保存」两步：选错文件不会直接覆盖线上配置
+            key.addView(UIKit.outlineButton(ctx, "从文本文件导入",
+                            v -> actions.onImportSystemPrompt()),
+                    UIKit.matchWrap(ctx, 6f));
+            key.addView(UIKit.outlineButton(ctx, "从剪贴板导入",
+                            v -> actions.onImportSystemPromptFromClipboard()),
+                    UIKit.matchWrap(ctx, 6f));
+            UIKit.hint(key, ctx,
+                    "导入只是把内容填进上面的输入框，仍需点「保存配置」才落盘。"
+                            + "导出：长按输入框全选复制即可。", 6);
             page.addView(key);
-
-            // ---------- 悬浮球 ----------
-            LinearLayout ball = UIKit.card(ctx);
-            ball.addView(UIKit.sectionTitle(ctx, "悬浮球"));
-            swFloatBall = UIKit.switchRow(ball, ctx, "启用应用内悬浮球",
-                    "点击悬浮球唤起控制面板；无需悬浮窗权限",
-                    ConfigManager.DEFAULT_FLOAT_BALL_ENABLED);
-            page.addView(ball);
 
             // ---------- 日志 ----------
             LinearLayout log = UIKit.card(ctx);
@@ -357,6 +429,7 @@ final class Pages {
             etConcurrency.setText(String.valueOf(ConfigManager.getMaxConcurrency(ctx)));
             etTimeout.setText(String.valueOf(ConfigManager.getRequestTimeoutMs(ctx)));
             etRetryMax.setText(String.valueOf(ConfigManager.getAutoRetryMax(ctx)));
+            etHeartbeatInterval.setText(String.valueOf(ConfigManager.getHeartbeatIntervalMs(ctx)));
             etApiKey.setText(ConfigManager.getApiKey(ctx));
             etSystemPrompt.setText(ConfigManager.getSystemPrompt(ctx));
 
@@ -365,7 +438,8 @@ final class Pages {
             swChunked.setChecked(ConfigManager.isChunkedStreamEnabled(ctx));
             swAutoWake.setChecked(ConfigManager.isAutoWakeEnabled(ctx));
             swKeepAlive.setChecked(ConfigManager.isKeepAliveEnabled(ctx));
-            swFloatBall.setChecked(ConfigManager.isFloatBallEnabled(ctx));
+            swOverlayBall.setChecked(ConfigManager.isOverlayBallEnabled(ctx));
+            swHeartbeat.setChecked(ConfigManager.isHeartbeatEnabled(ctx));
             swApiKey.setChecked(ConfigManager.isApiKeyEnabled(ctx));
             swCors.setChecked(ConfigManager.isCorsEnabled(ctx));
             swAutoRetry.setChecked(ConfigManager.isAutoRetryEnabled(ctx));
@@ -392,16 +466,20 @@ final class Pages {
             if (timeout == null) return "请求超时必须是数字";
             Integer retryMax = parse(etRetryMax);
             if (retryMax == null) return "重试次数必须是数字";
+            Integer heartbeatInterval = parse(etHeartbeatInterval);
+            if (heartbeatInterval == null) return "心跳间隔必须是数字";
 
             int clampedPort = ConfigManager.clampPort(port);
             int clampedConcurrency = ConfigManager.clampConcurrency(concurrency);
             int clampedTimeout = ConfigManager.clampRequestTimeoutMs(timeout);
             int clampedRetry = ConfigManager.clampAutoRetryMax(retryMax);
+            int clampedHeartbeat = ConfigManager.clampHeartbeatIntervalMs(heartbeatInterval);
 
             ConfigManager.setPort(ctx, clampedPort);
             ConfigManager.setMaxConcurrency(ctx, clampedConcurrency);
             ConfigManager.setRequestTimeoutMs(ctx, clampedTimeout);
             ConfigManager.setAutoRetryMax(ctx, clampedRetry);
+            ConfigManager.setHeartbeatIntervalMs(ctx, clampedHeartbeat);
             ConfigManager.setApiKey(ctx, text(etApiKey));
             ConfigManager.setSystemPrompt(ctx, text(etSystemPrompt));
             ConfigManager.setApiFormat(ctx, format);
@@ -412,7 +490,8 @@ final class Pages {
             ConfigManager.setChunkedStreamEnabled(ctx, swChunked.isChecked());
             ConfigManager.setAutoWakeEnabled(ctx, swAutoWake.isChecked());
             ConfigManager.setKeepAliveEnabled(ctx, swKeepAlive.isChecked());
-            ConfigManager.setFloatBallEnabled(ctx, swFloatBall.isChecked());
+            ConfigManager.setOverlayBallEnabled(ctx, swOverlayBall.isChecked());
+            ConfigManager.setHeartbeatEnabled(ctx, swHeartbeat.isChecked());
             ConfigManager.setApiKeyEnabled(ctx, swApiKey.isChecked());
             ConfigManager.setCorsEnabled(ctx, swCors.isChecked());
             ConfigManager.setAutoRetryEnabled(ctx, swAutoRetry.isChecked());
@@ -420,6 +499,16 @@ final class Pages {
             load(ctx);
             return "配置已保存（端口 " + clampedPort + "，并发 " + clampedConcurrency
                     + "，格式 " + format + "）";
+        }
+
+        /** 把导入的文本填进系统提示输入框（不落盘，用户仍需点保存） */
+        void setSystemPromptText(String text) {
+            etSystemPrompt.setText(text == null ? "" : text);
+        }
+
+        /** 供「复制密钥」读取当前输入框里的值（可能刚生成还没保存） */
+        String currentApiKeyText() {
+            return text(etApiKey);
         }
 
         private void applyFormatTabs(Context ctx) {
@@ -543,7 +632,7 @@ final class Pages {
 
     // ==================== 共享支撑 ====================
 
-    /** 页面动作回调，由 MainActivity 实现（需要 Activity 能力：剪贴板/跳转/Toast） */
+    /** 页面动作回调，由 MainActivity 实现（需要 Activity 能力：剪贴板/跳转/Toast/文件选择） */
     interface Actions {
         void onRefresh();
 
@@ -554,6 +643,26 @@ final class Pages {
         void onOpenTargetApp();
 
         void onSaveConfig();
+
+        // ---- v3.9 ----
+
+        /** 生成一个新 API Key 并填入输入框（同时打开鉴权开关） */
+        void onGenerateApiKey();
+
+        /** 复制当前 API Key 到剪贴板 */
+        void onCopyApiKey();
+
+        /** 通过系统文件选择器（SAF）导入一个文本文件作为系统提示词 */
+        void onImportSystemPrompt();
+
+        /** 从剪贴板导入系统提示词 */
+        void onImportSystemPromptFromClipboard();
+
+        /** 跳系统设置页申请「显示在其他应用上层」权限 */
+        void onRequestOverlayPermission();
+
+        /** 立即按当前开关启停系统悬浮球服务（不等待保存） */
+        void onApplyOverlayBall();
     }
 
     /** 探测结果：由 MainActivity 从 {@code GET /status} 拉取后填入 */
@@ -571,6 +680,13 @@ final class Pages {
         long failed;
         long autoRetries;
         long avgLatencyMs;
+        // ---- v3.9 ----
+        long toolRequests;
+        long toolCalls;
+        String lastToolNames = "";
+        boolean heartbeatEnabled;
+        int heartbeatIntervalMs = ConfigManager.DEFAULT_HEARTBEAT_INTERVAL_MS;
+        long heartbeatTicks;
     }
 
     /** 把内联的竖排 LinearLayout 创建收口，避免每页重复样板 */

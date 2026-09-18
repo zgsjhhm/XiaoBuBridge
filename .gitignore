@@ -36,6 +36,10 @@ DebugProbesKt.bin
 /com/
 /google/
 
+# ---- 工坊构建日志与工程类型元数据（本机产物，不入库）----
+.wanxiang/
+.wanxiang-project.properties
+
 # ---- IDE ----
 .idea/
 *.iml

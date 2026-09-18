@@ -7,7 +7,7 @@ import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.net.Uri;
 
-import de.robv.android.xposed.XposedBridge;
+
 
 /**
  * XiaoBuBridge v2.0 统一配置中心。
@@ -43,8 +43,6 @@ public final class ConfigManager {
     public static final String KEY_STREAM_ENABLED = "stream_enabled";
     public static final String KEY_SYSTEM_PROMPT = "system_prompt";
     public static final String KEY_MAX_CONCURRENCY = "max_concurrency";
-    /** v3.0 悬浮球开关 */
-    public static final String KEY_FLOAT_BALL_ENABLED = "float_ball_enabled";
     /** v3.6 请求到达时自动唤醒小布（小布后台时收不到任何回调，必须先拉到前台） */
     public static final String KEY_AUTO_WAKE_ENABLED = "auto_wake_enabled";
     /** v3.6 保活：拦截小布自身的空闲自杀定时器，避免请求处理到一半进程消失 */
@@ -65,6 +63,23 @@ public final class ConfigManager {
     /** 单次请求等待回答的超时（毫秒） */
     public static final String KEY_REQUEST_TIMEOUT_MS = "request_timeout_ms";
 
+    // ---- v3.9 系统悬浮球 / 心跳保活 ----
+
+    /**
+     * v3.9 系统悬浮球：由模块进程的常驻前台服务用 {@code WindowManager} 挂
+     * {@code TYPE_APPLICATION_OVERLAY} 窗口，即「安卓系统授予的悬浮窗」，
+     * 需要用户在系统设置里授予「显示在其他应用上层」权限。
+     *
+     * <p>v3.0 的应用内悬浮球（hook 进小布 decorView）已移除：它只在小布前台时存在，
+     * 而需要网关开关的场景恰恰是小布在后台，两条通道并存只会让人分不清该开哪个。
+     * 现在只保留这一条——任何界面都可见，承担「网关开关 + 保活心跳」的常驻入口。</p>
+     */
+    public static final String KEY_OVERLAY_BALL_ENABLED = "overlay_ball_enabled";
+    /** v3.9 心跳保活：常驻服务周期性探测网关并维持小布会话存活的开关 */
+    public static final String KEY_HEARTBEAT_ENABLED = "heartbeat_enabled";
+    /** v3.9 心跳间隔（毫秒） */
+    public static final String KEY_HEARTBEAT_INTERVAL_MS = "heartbeat_interval_ms";
+
     // ==================== 默认值 ====================
 
     public static final boolean DEFAULT_SERVER_ENABLED = true;
@@ -74,9 +89,8 @@ public final class ConfigManager {
     public static final String DEFAULT_LOG_LEVEL = "INFO";
     public static final boolean DEFAULT_STREAM_ENABLED = false;
     public static final String DEFAULT_SYSTEM_PROMPT = "";
-    public static final int DEFAULT_MAX_CONCURRENCY = 2;
-    /** v3.0 悬浮球默认关闭 */
-    public static final boolean DEFAULT_FLOAT_BALL_ENABLED = false;
+    /** v3.9 默认并发 3：单对话框串行锁下 3 是「吞吐/排队」比较平衡的档位 */
+    public static final int DEFAULT_MAX_CONCURRENCY = 3;
     /** v3.6 自动唤醒默认开启：不开的话每次调用前都得手动解锁并打开小布 */
     public static final boolean DEFAULT_AUTO_WAKE_ENABLED = true;
     /** v3.6 保活默认关闭：会让小布常驻，耗电与可见性先由用户确认 */
@@ -100,6 +114,17 @@ public final class ConfigManager {
     public static final int DEFAULT_REQUEST_TIMEOUT_MS = 60000;
     public static final int MIN_REQUEST_TIMEOUT_MS = 10000;
     public static final int MAX_REQUEST_TIMEOUT_MS = 300000;
+
+    // ---- v3.9 系统悬浮球 / 心跳保活 ----
+
+    /** v3.9 系统悬浮球默认关闭：需要用户在系统设置里手动授权，不能默认替用户打开 */
+    public static final boolean DEFAULT_OVERLAY_BALL_ENABLED = false;
+    /** v3.9 心跳保活默认关闭：会周期性拉起小布，耗电与可见性先由用户确认 */
+    public static final boolean DEFAULT_HEARTBEAT_ENABLED = false;
+    /** v3.9 心跳间隔默认 60 秒：小布空闲自杀窗口约 10/50/90 秒，60s 内必有一次心跳 */
+    public static final int DEFAULT_HEARTBEAT_INTERVAL_MS = 60000;
+    public static final int MIN_HEARTBEAT_INTERVAL_MS = 15000;
+    public static final int MAX_HEARTBEAT_INTERVAL_MS = 600000;
 
     /** 端口合法区间（避开特权端口） */
     public static final int MIN_PORT = 1024;
@@ -140,6 +165,32 @@ public final class ConfigManager {
         return value;
     }
 
+    /** 心跳间隔越界时收敛 */
+    public static int clampHeartbeatIntervalMs(int value) {
+        if (value < MIN_HEARTBEAT_INTERVAL_MS) return MIN_HEARTBEAT_INTERVAL_MS;
+        if (value > MAX_HEARTBEAT_INTERVAL_MS) return MAX_HEARTBEAT_INTERVAL_MS;
+        return value;
+    }
+
+    /**
+     * v3.9 生成一个随机 API Key（用作「更改 API Key」的默认值）。
+     *
+     * <p>为什么不用 {@code UUID.randomUUID()}：UUID v4 只保证 122 位随机，
+     * 且形式固定（8-4-4-4-12），这里用 {@link java.security.SecureRandom}
+     * 直接取 24 字节再转 base62，得到固定 32 字符、无歧义前缀的密钥，
+     * 便于客户端复制粘贴，也避免 UUID 里 '-' 在某些 shell/配置里被转义。</p>
+     */
+    public static String generateApiKey() {
+        final String alphabet =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        StringBuilder sb = new StringBuilder("sk-xb-");
+        for (int i = 0; i < 32; i++) {
+            sb.append(alphabet.charAt(random.nextInt(alphabet.length())));
+        }
+        return sb.toString();
+    }
+
     /** API 格式只接受白名单值，其余一律回退默认（避免 UI 侧写入脏值导致路由失效） */
     public static String normalizeApiFormat(String raw) {
         if (API_FORMAT_OPENAI.equals(raw) || API_FORMAT_ANTHROPIC.equals(raw)
@@ -158,9 +209,10 @@ public final class ConfigManager {
     public static final String[] ALL_KEYS = new String[]{
             KEY_SERVER_ENABLED, KEY_PORT, KEY_API_KEY_ENABLED, KEY_API_KEY,
             KEY_LOG_LEVEL, KEY_STREAM_ENABLED, KEY_SYSTEM_PROMPT, KEY_MAX_CONCURRENCY,
-            KEY_FLOAT_BALL_ENABLED, KEY_AUTO_WAKE_ENABLED, KEY_KEEP_ALIVE_ENABLED,
+            KEY_AUTO_WAKE_ENABLED, KEY_KEEP_ALIVE_ENABLED,
             KEY_CHUNKED_STREAM_ENABLED, KEY_API_FORMAT, KEY_CORS_ENABLED,
             KEY_AUTO_RETRY_ENABLED, KEY_AUTO_RETRY_MAX, KEY_REQUEST_TIMEOUT_MS,
+            KEY_OVERLAY_BALL_ENABLED, KEY_HEARTBEAT_ENABLED, KEY_HEARTBEAT_INTERVAL_MS,
     };
 
     // ==================== UI 侧（模块进程） ====================
@@ -238,16 +290,6 @@ public final class ConfigManager {
         prefs(ctx).edit().putInt(KEY_MAX_CONCURRENCY, clampConcurrency(value)).apply();
     }
 
-    // ==================== v3.0 悬浮球配置 ====================
-
-    public static boolean isFloatBallEnabled(Context ctx) {
-        return prefs(ctx).getBoolean(KEY_FLOAT_BALL_ENABLED, DEFAULT_FLOAT_BALL_ENABLED);
-    }
-
-    public static void setFloatBallEnabled(Context ctx, boolean enabled) {
-        prefs(ctx).edit().putBoolean(KEY_FLOAT_BALL_ENABLED, enabled).apply();
-    }
-
     // ==================== v3.6 运行期优化配置 ====================
 
     public static boolean isAutoWakeEnabled(Context ctx) {
@@ -317,6 +359,34 @@ public final class ConfigManager {
         prefs(ctx).edit().putInt(KEY_REQUEST_TIMEOUT_MS, clampRequestTimeoutMs(value)).apply();
     }
 
+    // ==================== v3.9 系统悬浮球 / 心跳保活（UI 侧） ====================
+
+    public static boolean isOverlayBallEnabled(Context ctx) {
+        return prefs(ctx).getBoolean(KEY_OVERLAY_BALL_ENABLED, DEFAULT_OVERLAY_BALL_ENABLED);
+    }
+
+    public static void setOverlayBallEnabled(Context ctx, boolean enabled) {
+        prefs(ctx).edit().putBoolean(KEY_OVERLAY_BALL_ENABLED, enabled).apply();
+    }
+
+    public static boolean isHeartbeatEnabled(Context ctx) {
+        return prefs(ctx).getBoolean(KEY_HEARTBEAT_ENABLED, DEFAULT_HEARTBEAT_ENABLED);
+    }
+
+    public static void setHeartbeatEnabled(Context ctx, boolean enabled) {
+        prefs(ctx).edit().putBoolean(KEY_HEARTBEAT_ENABLED, enabled).apply();
+    }
+
+    public static int getHeartbeatIntervalMs(Context ctx) {
+        return clampHeartbeatIntervalMs(
+                prefs(ctx).getInt(KEY_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS));
+    }
+
+    public static void setHeartbeatIntervalMs(Context ctx, int value) {
+        prefs(ctx).edit()
+                .putInt(KEY_HEARTBEAT_INTERVAL_MS, clampHeartbeatIntervalMs(value)).apply();
+    }
+
     // ==================== Hook 侧（小布进程） ====================
 
     /** 目标 App 进程内的 Context；Xposed 框架注入，失败返回 null */
@@ -346,7 +416,7 @@ public final class ConfigManager {
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " getStringInTarget(" + key + ") failed: " + t);
+            BridgeLog.i(TAG + " getStringInTarget(" + key + ") failed: " + t);
         } finally {
             if (cursor != null) {
                 try {
@@ -405,10 +475,6 @@ public final class ConfigManager {
         }
     }
 
-    public static boolean isFloatBallEnabledInTarget() {
-        return getBooleanInTarget(KEY_FLOAT_BALL_ENABLED, DEFAULT_FLOAT_BALL_ENABLED);
-    }
-
     public static boolean isAutoWakeEnabledInTarget() {
         return getBooleanInTarget(KEY_AUTO_WAKE_ENABLED, DEFAULT_AUTO_WAKE_ENABLED);
     }
@@ -454,6 +520,46 @@ public final class ConfigManager {
         }
     }
 
+    // ==================== v3.9 系统悬浮球 / 心跳保活（Hook 侧） ====================
+
+    public static boolean isOverlayBallEnabledInTarget() {
+        return getBooleanInTarget(KEY_OVERLAY_BALL_ENABLED, DEFAULT_OVERLAY_BALL_ENABLED);
+    }
+
+    public static boolean isHeartbeatEnabledInTarget() {
+        return getBooleanInTarget(KEY_HEARTBEAT_ENABLED, DEFAULT_HEARTBEAT_ENABLED);
+    }
+
+    public static int getHeartbeatIntervalMsInTarget() {
+        String raw = getStringInTarget(KEY_HEARTBEAT_INTERVAL_MS,
+                String.valueOf(DEFAULT_HEARTBEAT_INTERVAL_MS));
+        try {
+            return clampHeartbeatIntervalMs(Integer.parseInt(raw.trim()));
+        } catch (Throwable t) {
+            return DEFAULT_HEARTBEAT_INTERVAL_MS;
+        }
+    }
+
+    /** Hook 侧写入心跳开关（供系统悬浮球面板调用） */
+    public static boolean setHeartbeatEnabledInTarget(boolean enabled) {
+        return setBooleanInTarget(KEY_HEARTBEAT_ENABLED, enabled);
+    }
+
+    /** Hook 侧写入网关开关（供系统悬浮球面板调用） */
+    public static boolean setServerEnabledInTarget(boolean enabled) {
+        return setBooleanInTarget(KEY_SERVER_ENABLED, enabled);
+    }
+
+    /** Hook 侧写入 API Key（供系统悬浮球面板调用） */
+    public static boolean setApiKeyInTarget(String value) {
+        return setStringInTarget(KEY_API_KEY, value == null ? "" : value);
+    }
+
+    /** Hook 侧写入 API Key 鉴权开关 */
+    public static boolean setApiKeyEnabledInTarget(boolean enabled) {
+        return setBooleanInTarget(KEY_API_KEY_ENABLED, enabled);
+    }
+
     /**
      * Hook 侧写入一项配置：通过 ContentResolver 写回模块进程的 ConfigProvider。
      *
@@ -467,7 +573,7 @@ public final class ConfigManager {
     public static boolean setStringInTarget(String key, String value) {
         Context ctx = targetContext();
         if (ctx == null) {
-            XposedBridge.log(TAG + " setStringInTarget(" + key + "): target context is null");
+            BridgeLog.i(TAG + " setStringInTarget(" + key + "): target context is null");
             return false;
         }
         try {
@@ -477,7 +583,7 @@ public final class ConfigManager {
             ctx.getContentResolver().insert(uri, values);
             return true;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " setStringInTarget(" + key + "=" + value + ") failed: " + t);
+            BridgeLog.i(TAG + " setStringInTarget(" + key + "=" + value + ") failed: " + t);
             return false;
         }
     }
@@ -487,8 +593,4 @@ public final class ConfigManager {
         return setStringInTarget(key, String.valueOf(value));
     }
 
-    /** Hook 侧写入浮球开关（供控制面板的「隐藏悬浮球」调用） */
-    public static boolean setFloatBallEnabledInTarget(boolean enabled) {
-        return setBooleanInTarget(KEY_FLOAT_BALL_ENABLED, enabled);
-    }
 }

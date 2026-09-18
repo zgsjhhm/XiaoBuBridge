@@ -6,7 +6,20 @@
 
     <!-- v2.0 配置面板 + 网络监听 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- v3.0 悬浮球改为应用内悬浮（Hook decorView），无需 SYSTEM_ALERT_WINDOW 权限 -->
+    <!-- v3.9 系统悬浮球：模块进程的常驻前台服务用 WindowManager 挂系统窗口。
+         这是「安卓系统授予的悬浮球」，需用户在系统设置里手动授权。 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- v3.9 常驻服务通知（心跳保活 / 悬浮球） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14(API 34) 起：manifest 里把服务声明为 foregroundServiceType="specialUse"
+         时，startForeground() 会校验同名的 FOREGROUND_SERVICE_SPECIAL_USE 权限。
+         缺这一条会在 setServiceForeground 里抛 SecurityException，服务一起就崩，
+         表现为「开关打开了但悬浮球始终不出现」。低版本系统会忽略该未知权限。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- v3.10 悬浮球复活：重启 / 模块覆盖安装后自动恢复常驻服务 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- v3.0 应用内悬浮球（Hook decorView）仍免权限保留 -->
 
     <!-- Android 11(API 30) 起启用包可见性过滤：未在此声明的包，
          PackageManager.getPackageInfo() 会抛 NameNotFoundException。
@@ -41,7 +54,32 @@
             android:name=".ConfigService"
             android:exported="false" />
 
-        <!-- v3.0 悬浮球改为应用内悬浮（Hook Activity.onResume），无需 Service -->
+        <!-- v3.9 系统悬浮球常驻服务：
+             用 TYPE_APPLICATION_OVERLAY 挂系统窗口，任何界面可见；
+             同时作为心跳保活的宿主。仅当用户在设置页打开开关时启动。 -->
+        <service
+            android:name=".OverlayBallService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="用户主动开启的桌面悬浮球与本地网关心跳保活" />
+        </service>
+
+        <!-- v3.0 应用内悬浮球（Hook decorView）不需要 Service -->
+
+        <!-- v3.10 悬浮球复活接收器：重启 / 模块覆盖安装 / 自检闹钟后重新拉起
+             OverlayBallService。没有它时，进程被系统回收后悬浮球会永久消失，
+             只能靠用户手动进设置页点一次才会回来（用户报的「球有时不见了」）。 -->
+        <receiver
+            android:name=".OverlayBallRestartReceiver"
+            android:exported="false"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- v2.0 跨应用只读配置通道：小布进程通过 ContentResolver 读取配置。
              必须 exported=true 才能被 com.heytap.speechassist 访问；
@@ -58,7 +96,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="将小布助手 AI 对话封装为 OpenAI 兼容本地 API（v3.0 悬浮球控制面板）" />
+            android:value="将小布助手 AI 对话封装为 OpenAI 兼容本地 API（v3.11 系统悬浮球：可拖半屏面板 + 消失自愈）" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />

@@ -22,8 +22,37 @@ android {
         //       Anthropic / legacy 端点、CORS 开关、自动重试、运行统计。
         // v3.8：工具调用层内嵌（XML 协议注入 + 解析校正 + 预算裁剪 + tool_calls 契约），
         //       由 ToolCallPrompt / ToolCallCodec / ToolCallBridge 承担。
-        versionCode = 30800
-        versionName = "3.8"
+        // v3.9：系统悬浮球（SYSTEM_ALERT_WINDOW 前台服务，承载网关开关 / API Key /
+        //       心跳保活）、心跳保活看门狗（GatewayWatchdog）、运行状态新增工具调用指标、
+        //       并发默认 3、System Prompt 支持文本导入。
+        // v3.10：移除应用内悬浮球（FloatingBall / FloatingPanel / UiInjector 及其配置项），
+        //       只保留系统悬浮球；补齐 FOREGROUND_SERVICE_SPECIAL_USE 权限并兜住
+        //       startForeground 异常 —— 原先缺该权限导致服务启动即崩、悬浮球永不出现。
+        // v3.11：悬浮球面板改固定半屏高 + 内部滚动 + 可拖动（拖标题栏，位置会记住）；
+        //       新增悬浮球消失后的自愈路径（服务内 5s 巡检、配置变化真正提交布局、
+        //       BOOT_COMPLETED / MY_PACKAGE_REPLACED 复活、自检闹钟、MainActivity 打开即同步）。
+        // v3.12：修复「从最近任务划掉模块卡片后悬浮球消失且不再回来」。ColorOS 划掉
+        //       等于对整包 force-stop（am_kill ... o-stop(40)），会连带停服务、撤通知
+        //       并清空该包全部闹钟——v3.10 靠闹钟复活的路径因此天然失效。改为挂在
+        //       「小布进程按需拉起模块进程」这条稳定路径上自愈：ConfigProvider 在
+        //       process 启动与每次 query 时按配置补一次 OverlayBallService。
+        // ---- 版本通道（v3.12 起）----
+        // 正式版（GitHub Release）：versionName "3.12"       / versionCode 31200
+        // 本地测试版（-Pchannel=local）：versionName "3.12.99-local" / versionCode 31299
+        //   patch 固定取 99：测试版号恒高于同一 patch 的正式版（可覆盖安装正式版做验证），
+        //   又恒低于下一个次版本正式版（3.13 -> 31300），不会把后续正式升级挡在门外。
+        // 默认走 release：漏传参数时宁可产出正式号，也不能让测试号混进发布产物——
+        // 测试号 31299 一旦发出，会把正式版 31200 反过来挡在安装门外。
+        val channel = (project.findProperty("channel") as String?) ?: "release"
+        val officialCode = 31200
+        val officialName = "3.12"
+        if (channel == "local") {
+            versionCode = officialCode + 99
+            versionName = "$officialName.99-local"
+        } else {
+            versionCode = officialCode
+            versionName = officialName
+        }
     }
 
     buildTypes {

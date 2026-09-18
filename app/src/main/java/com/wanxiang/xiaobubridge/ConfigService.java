@@ -44,8 +44,6 @@ public class ConfigService extends Service {
                 return ConfigManager.getSystemPrompt(ctx);
             } else if (ConfigManager.KEY_MAX_CONCURRENCY.equals(key)) {
                 return String.valueOf(ConfigManager.getMaxConcurrency(ctx));
-            } else if (ConfigManager.KEY_FLOAT_BALL_ENABLED.equals(key)) {
-                return String.valueOf(ConfigManager.isFloatBallEnabled(ctx));
             } else if (ConfigManager.KEY_CHUNKED_STREAM_ENABLED.equals(key)) {
                 return String.valueOf(ConfigManager.isChunkedStreamEnabled(ctx));
             } else if (ConfigManager.KEY_AUTO_WAKE_ENABLED.equals(key)) {
@@ -62,6 +60,12 @@ public class ConfigService extends Service {
                 return String.valueOf(ConfigManager.getAutoRetryMax(ctx));
             } else if (ConfigManager.KEY_REQUEST_TIMEOUT_MS.equals(key)) {
                 return String.valueOf(ConfigManager.getRequestTimeoutMs(ctx));
+            } else if (ConfigManager.KEY_OVERLAY_BALL_ENABLED.equals(key)) {
+                return String.valueOf(ConfigManager.isOverlayBallEnabled(ctx));
+            } else if (ConfigManager.KEY_HEARTBEAT_ENABLED.equals(key)) {
+                return String.valueOf(ConfigManager.isHeartbeatEnabled(ctx));
+            } else if (ConfigManager.KEY_HEARTBEAT_INTERVAL_MS.equals(key)) {
+                return String.valueOf(ConfigManager.getHeartbeatIntervalMs(ctx));
             }
             return "";
         }
@@ -93,8 +97,6 @@ public class ConfigService extends Service {
                 } catch (Throwable ignored) {
                     // 非法并发值忽略，保留旧值
                 }
-            } else if (ConfigManager.KEY_FLOAT_BALL_ENABLED.equals(key)) {
-                ConfigManager.setFloatBallEnabled(ctx, "true".equalsIgnoreCase(value));
             } else if (ConfigManager.KEY_CHUNKED_STREAM_ENABLED.equals(key)) {
                 ConfigManager.setChunkedStreamEnabled(ctx, "true".equalsIgnoreCase(value));
             } else if (ConfigManager.KEY_AUTO_WAKE_ENABLED.equals(key)) {
@@ -118,6 +120,16 @@ public class ConfigService extends Service {
                     ConfigManager.setRequestTimeoutMs(ctx, Integer.parseInt(value.trim()));
                 } catch (Throwable ignored) {
                     // 非法超时值忽略，保留旧值
+                }
+            } else if (ConfigManager.KEY_OVERLAY_BALL_ENABLED.equals(key)) {
+                ConfigManager.setOverlayBallEnabled(ctx, "true".equalsIgnoreCase(value));
+            } else if (ConfigManager.KEY_HEARTBEAT_ENABLED.equals(key)) {
+                ConfigManager.setHeartbeatEnabled(ctx, "true".equalsIgnoreCase(value));
+            } else if (ConfigManager.KEY_HEARTBEAT_INTERVAL_MS.equals(key)) {
+                try {
+                    ConfigManager.setHeartbeatIntervalMs(ctx, Integer.parseInt(value.trim()));
+                } catch (Throwable ignored) {
+                    // 非法心跳间隔忽略，保留旧值
                 }
             }
         }
@@ -155,6 +167,10 @@ public class ConfigService extends Service {
                 json.put("autoRetry", ConfigManager.isAutoRetryEnabled(ConfigService.this));
                 json.put("autoRetryMax", ConfigManager.getAutoRetryMax(ConfigService.this));
                 json.put("requestTimeoutMs", ConfigManager.getRequestTimeoutMs(ConfigService.this));
+                json.put("overlayBall", ConfigManager.isOverlayBallEnabled(ConfigService.this));
+                json.put("heartbeat", ConfigManager.isHeartbeatEnabled(ConfigService.this));
+                json.put("heartbeatIntervalMs",
+                        ConfigManager.getHeartbeatIntervalMs(ConfigService.this));
                 json.put("pid", android.os.Process.myPid());
                 json.put("time", System.currentTimeMillis());
             } catch (Throwable t) {

@@ -159,14 +159,15 @@ public class MainHook implements IXposedHookLoadPackage {
             // ---- 通道 3（v3.6）：拦截小布的空闲自杀，避免请求处理到一半宿主消失 ----
             installKillSelfGuard(lpparam.classLoader);
 
+            // ---- v3.9：网关看门狗 + 心跳保活（仅主进程） ----
+            if (isMainProcess) {
+                GatewayWatchdog.startOnce();
+            }
+
             // HTTP Server 只在主进程启动：:aiCall / :remote / :downloader 等多进程各自绑定
             // 同一端口会抛 EADDRINUSE，导致真正的服务进程反而起不来。
             if (isMainProcess) {
                 startHttpServer();
-
-                // v3.0 悬浮球：钩住 Activity.onResume，将悬浮球注入到小布 App 内部的 decor view。
-                // 无需 SYSTEM_ALERT_WINDOW 权限，悬浮球仅在小布 App 内部显示。
-                UiInjector.install();
             } else {
                 XposedBridge.log(TAG + " Skip HTTP Server in non-main process: " + processName);
             }
@@ -434,7 +435,9 @@ public class MainHook implements IXposedHookLoadPackage {
      * {@code Process.killProcess} 这类通用出口</b>：小布在 AppApplication 里
      * 还有「资源被篡改 → 自杀」的自保护逻辑，一刀切会连带影响它的正常保护行为。</p>
      *
-     * <p>开关在<b>调用时</b>读取，因此 UI 里改完立即生效，不需要重启宿主。</p>
+     * <p>开关在<b>调用时</b>读取（v3.9 起统一交给
+     * {@link GatewayWatchdog#shouldBlockKillSelf()}，让「心跳保活」也能启用它），
+     * 因此 UI 里改完立即生效，不需要重启宿主。</p>
      */
     private void installKillSelfGuard(final ClassLoader cl) {
         // ---- 1) 不布防：跳过 e4.K(Context) ----
@@ -443,7 +446,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(e4, "K", android.content.Context.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    if (!ConfigManager.isKeepAliveEnabledInTarget()) {
+                    if (!GatewayWatchdog.shouldBlockKillSelf()) {
                         return;
                     }
                     XposedBridge.log(TAG + " [keepalive] suppressed kill-self timer arming (e4.K)");
@@ -456,7 +459,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(e4, "y", android.content.Context.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    if (!ConfigManager.isKeepAliveEnabledInTarget()) {
+                    if (!GatewayWatchdog.shouldBlockKillSelf()) {
                         return;
                     }
                     XposedBridge.log(TAG + " [keepalive] suppressed e4.y kill-self");
@@ -474,7 +477,7 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(t2, "x", android.content.Context.class, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    if (!ConfigManager.isKeepAliveEnabledInTarget()) {
+                    if (!GatewayWatchdog.shouldBlockKillSelf()) {
                         return;
                     }
                     XposedBridge.log(TAG + " [keepalive] suppressed t2.x killSelfProcess");
@@ -526,22 +529,30 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         }
 
-                        // 如果配置显示禁用，仍然使用默认值启动（用户可以在 UI 中修改）
-                        if (!serverEnabled) {
-                            XposedBridge.log(TAG + " Server disabled or config unavailable, using default: "
-                                    + ConfigManager.DEFAULT_SERVER_ENABLED + ", port: " + ConfigManager.DEFAULT_PORT);
-                            serverEnabled = ConfigManager.DEFAULT_SERVER_ENABLED;
-                            port = ConfigManager.DEFAULT_PORT;
-                        }
-
-                        if (!serverEnabled) {
-                            XposedBridge.log(TAG + " Server disabled by config, skip start");
-                            return;
-                        }
-
+                        // 对象先建出来、再看配置决定是否监听。
+                        //
+                        // v3.9 修正：旧实现在这里「读不到配置就用默认值强行启动」，
+                        // 于是用户在小布没起来时关掉网关，下次冷启动仍会被拉起——
+                        // 「关了又自己开」。现在读不到就只有一条路径：按默认值
+                        // 启动监听（默认值是 true，首次安装行为不变），但
+                        // <b>一旦读到了明确的 false 就绝不启动</b>，之后由看门狗
+                        // 按配置实时跟随，用户关掉就是真的关掉。
                         httpServer = new OpenAIServer(port);
-                        httpServer.start();
-                        XposedBridge.log(TAG + " HTTP Server started on port " + port);
+
+                        boolean enabledByConfig;
+                        try {
+                            enabledByConfig = ConfigManager.isServerEnabledInTarget();
+                        } catch (Throwable t) {
+                            enabledByConfig = ConfigManager.DEFAULT_SERVER_ENABLED;
+                        }
+
+                        if (enabledByConfig) {
+                            httpServer.setEnabled(true);
+                            XposedBridge.log(TAG + " HTTP Server listening on port " + port);
+                        } else {
+                            XposedBridge.log(TAG + " HTTP Server created but NOT listening"
+                                    + " (server_enabled=false); watchdog will follow config");
+                        }
                     } catch (Exception e) {
                         XposedBridge.log(TAG + " Failed to start HTTP Server: " + e.getMessage());
                         XposedBridge.log(e);
@@ -549,5 +560,20 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
         }
+    }
+
+    // ==================== v3.9 供看门狗访问 ====================
+
+    /** 当前 HTTP Server 实例；尚未创建返回 null */
+    public static OpenAIServer getHttpServer() {
+        return httpServer;
+    }
+
+    /** 创建并（按配置）启动 HTTP Server；已存在则为空操作 */
+    public static void ensureHttpServer() {
+        if (httpServer != null) {
+            return;
+        }
+        new MainHook().startHttpServer();
     }
 }

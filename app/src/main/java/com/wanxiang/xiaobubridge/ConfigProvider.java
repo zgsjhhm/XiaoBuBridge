@@ -12,7 +12,7 @@ import android.os.Process;
 
 import java.util.Map;
 
-import de.robv.android.xposed.XposedBridge;
+
 
 /**
  * v2.0 跨应用只读配置通道。
@@ -48,8 +48,24 @@ public class ConfigProvider extends ContentProvider {
     public boolean onCreate() {
         Context ctx = getContext();
         if (ctx == null) return false;
-        prefs = ctx.getApplicationContext()
-                .getSharedPreferences(ConfigManager.PREFS_NAME, Context.MODE_PRIVATE);
+        Context app = ctx.getApplicationContext();
+        prefs = app.getSharedPreferences(ConfigManager.PREFS_NAME, Context.MODE_PRIVATE);
+
+        // v3.11 悬浮球自愈：本 Provider 是小布进程「按需拉起模块进程」的入口。
+        //
+        // ColorOS 从最近任务划掉模块卡片 = 对整包 force-stop（am_kill ... o-stop(40)），
+        // 杀进程的同时停掉 OverlayBallService、撤销前台通知，并清空该包的全部闹钟 —
+        // 所以 OverlayBallRestartReceiver 的「闹钟后复活」在 ColorOS 上必然无效。
+        //
+        // 但模块进程会被小布进程重新拉起：GatewayWatchdog 每秒查询一次配置，
+        // 该查询经本 Provider 落到模块进程，系统便以 content provider 为由把它启动
+        // （实测划掉后 0.7 秒）。进程刚起来时悬浮球服务必然不在跑，正是补回的时机。
+        // 幂等且带退避，正常运行时只读一个 volatile 即返回。
+        try {
+            OverlayBallService.requestSelfHealAsync(app);
+        } catch (Throwable t) {
+            BridgeLog.i("[XiaoBuBridge] ConfigProvider: overlay self-heal failed: " + t);
+        }
         return true;
     }
 
@@ -81,6 +97,16 @@ public class ConfigProvider extends ContentProvider {
                         String[] selectionArgs, String sortOrder) {
         MatrixCursor cursor = new MatrixCursor(COLUMNS);
         if (prefs == null || !isCallerAllowed()) return cursor;
+
+        // v3.11 自愈重试：小布进程的 GatewayWatchdog 每秒查询一次配置，这里顺带
+        // 兜一次悬浮球。首次自愈若被系统拒绝（后台启动 FGS 受节流），下一轮查询
+        // 会按退避间隔再试，直到服务起来或用户关掉开关。
+        // 服务已在跑时只读一个 volatile 即返回，正常路径零开销。
+        try {
+            OverlayBallService.requestSelfHealAsync(getContext());
+        } catch (Throwable t) {
+            BridgeLog.i("[XiaoBuBridge] ConfigProvider: overlay self-heal failed: " + t);
+        }
 
         String last = uri.getLastPathSegment();
         Map<String, ?> all = prefs.getAll();
@@ -132,7 +158,7 @@ public class ConfigProvider extends ContentProvider {
         if (value == null) return null;
 
         writeTyped(key, value);
-        XposedBridge.log("[XiaoBuBridge] ConfigProvider: wrote " + key + "=" + value);
+        BridgeLog.i("[XiaoBuBridge] ConfigProvider: wrote " + key + "=" + value);
         return uri.buildUpon().appendPath(key).build();
     }
 

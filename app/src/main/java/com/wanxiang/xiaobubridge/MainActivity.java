@@ -6,7 +6,9 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -55,6 +57,13 @@ public class MainActivity extends AppCompatActivity implements Pages.Actions {
 
     private static final String[] TAB_LABELS = {"主页", "设置", "关于"};
 
+    /** v3.9 System Prompt 文本导入的请求码 */
+    private static final int REQ_IMPORT_PROMPT = 0x5843;
+    /** v3.10 通知权限请求码（Android 13+ 前台服务常驻通知） */
+    private static final int REQ_NOTIFICATION_PERMISSION = 0x5845;
+    /** 导入上限：够放任意提示词，又不至于把 EditText 与 prefs 撑爆 */
+    private static final int MAX_IMPORT_BYTES = 64 * 1024;
+
     private FrameLayout content;
     private LinearLayout navBar;
     private View[] navPills;
@@ -100,6 +109,41 @@ public class MainActivity extends AppCompatActivity implements Pages.Actions {
     protected void onStart() {
         super.onStart();
         bindService(new Intent(this, ConfigService.class), conn, Context.BIND_AUTO_CREATE);
+
+        // v3.10：打开模块界面就把悬浮球服务对齐一次配置。
+        // 这是「球消失后重开小布没用」最直接的用户可见修复——小布进程与悬浮球
+        // 完全无关（球挂在模块进程的前台服务上），所以恢复入口必须在模块这一侧。
+        // 幂等：服务已在跑时只是一次空转，不会重复加窗口。
+        OverlayBallService.syncState(this);
+
+        // Android 13+ 常驻前台服务通知需要运行时授权；没通知时 ColorOS 更容易把
+        // 该进程当普通后台进程回收，悬浮球随之消失。只在需要时问一次。
+        ensureNotificationPermission();
+    }
+
+    /**
+     * 申请通知权限（Android 13+）。
+     *
+     * <p>权限本身不是悬浮球能显示的必要条件（悬浮窗是 {@code SYSTEM_ALERT_WINDOW}），
+     * 但前台服务的常驻通知不可见时，系统对「这个进程在前台服务」的判定会打折扣，
+     * 省电策略回收得更积极。因此这里在用户打开模块界面时顺手申请一次，拒绝了也不影响
+     * 其余功能。</p>
+     */
+    private void ensureNotificationPermission() {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                return;
+            }
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            requestPermissions(
+                    new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
+                    REQ_NOTIFICATION_PERMISSION);
+        } catch (Throwable t) {
+            BridgeLog.i("[XiaoBuBridge] requestNotifications failed: " + t);
+        }
     }
 
     @Override
@@ -234,7 +278,164 @@ public class MainActivity extends AppCompatActivity implements Pages.Actions {
     public void onSaveConfig() {
         String message = settingsPage.save(this);
         toast(message);
+        // 悬浮球/心跳开关改完要立刻按新配置同步服务状态，
+        // 否则用户「打开开关但没看到球」只能靠重启 App 解决。
+        OverlayBallService.syncState(this);
         refreshStatus();
+    }
+
+    // ==================== v3.9 Actions ====================
+
+    @Override
+    public void onGenerateApiKey() {
+        String key = ConfigManager.generateApiKey();
+        ConfigManager.setApiKey(this, key);
+        // 生成密钥的唯一目的是用它；不顺手开鉴权只会让人以为「生成了但没生效」
+        ConfigManager.setApiKeyEnabled(this, true);
+        settingsPage.load(this);
+        toast("已生成并启用新密钥");
+        refreshStatus();
+    }
+
+    @Override
+    public void onCopyApiKey() {
+        String key = settingsPage.currentApiKeyText();
+        if (key == null || key.trim().isEmpty()) {
+            toast("尚未设置密钥，请先点「生成新密钥」");
+            return;
+        }
+        ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm == null) {
+            toast("剪贴板不可用");
+            return;
+        }
+        cm.setPrimaryClip(ClipData.newPlainText("XiaoBuBridge API Key", key.trim()));
+        toast("密钥已复制到剪贴板");
+    }
+
+    @Override
+    public void onImportSystemPrompt() {
+        // SAF 而不是直接读路径：Android 10+ 分区存储下应用无法按路径访问
+        // 用户自己的文件，必须走系统选择器拿授权 URI。
+        try {
+            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            // text/plain 之外还有 .md/.json/.yaml 这类 common MIME 为
+            // application/* 的提示词文件，因此再放开一层，避免「文件灰着选不了」。
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES,
+                    new String[]{"text/*", "application/json", "application/octet-stream"});
+            startActivityForResult(intent, REQ_IMPORT_PROMPT);
+        } catch (Throwable t) {
+            // 部分精简 ROM 没有 DocumentsUI，退到剪贴板路径，而不是直接失败
+            toast("无法打开文件选择器，请改用「从剪贴板导入」");
+        }
+    }
+
+    @Override
+    public void onImportSystemPromptFromClipboard() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip() || cm.getPrimaryClip() == null
+                    || cm.getPrimaryClip().getItemCount() == 0) {
+                toast("剪贴板为空");
+                return;
+            }
+            CharSequence text = cm.getPrimaryClip().getItemAt(0).coerceToText(this);
+            applyImportedSystemPrompt(text == null ? "" : text.toString(), "剪贴板");
+        } catch (Throwable t) {
+            toast("读取剪贴板失败");
+        }
+    }
+
+    @Override
+    public void onRequestOverlayPermission() {
+        if (OverlayBallService.canDrawOverlays(this)) {
+            toast("悬浮窗权限已授予");
+            OverlayBallService.syncState(this);
+            return;
+        }
+        Toast.makeText(this, "请在系统设置里允许「显示在其他应用上层」", Toast.LENGTH_LONG).show();
+        OverlayBallService.requestOverlayPermission(this);
+    }
+
+    @Override
+    public void onApplyOverlayBall() {
+        if (ConfigManager.isOverlayBallEnabled(this)
+                && !OverlayBallService.canDrawOverlays(this)) {
+            toast("缺少悬浮窗权限，请先授予");
+            OverlayBallService.requestOverlayPermission(this);
+            return;
+        }
+        OverlayBallService.syncState(this);
+        toast(ConfigManager.isOverlayBallEnabled(this) ? "悬浮球服务已启动" : "悬浮球服务已停止");
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_IMPORT_PROMPT || resultCode != RESULT_OK || data == null) {
+            return;
+        }
+        Uri uri = data.getData();
+        if (uri == null) {
+            return;
+        }
+        new Thread(() -> {
+            String content = null;
+            String error = null;
+            try {
+                content = readTextFile(uri);
+            } catch (Throwable t) {
+                error = String.valueOf(t.getMessage());
+            }
+            final String text = content;
+            final String err = error;
+            mainHandler.post(() -> {
+                if (err != null) {
+                    toast("读取失败：" + err);
+                } else {
+                    applyImportedSystemPrompt(text, "文件");
+                }
+            });
+        }, "xiaobu-import-prompt").start();
+    }
+
+    /** 读一个 content:// 文本文件；超过上限直接拒绝，避免把编辑框和 prefs 撑爆 */
+    private String readTextFile(Uri uri) throws Exception {
+        InputStream in = getContentResolver().openInputStream(uri);
+        if (in == null) {
+            throw new Exception("无法打开该文件");
+        }
+        try {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                if (bos.size() + n > MAX_IMPORT_BYTES) {
+                    throw new Exception("文件超过 " + (MAX_IMPORT_BYTES / 1024) + "KB 上限");
+                }
+                bos.write(buf, 0, n);
+            }
+            return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        } finally {
+            try {
+                in.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 导入结果只填进输入框；落盘由用户点「保存配置」完成 */
+    private void applyImportedSystemPrompt(String text, String source) {
+        String value = text == null ? "" : text;
+        if (value.isEmpty()) {
+            toast(source + "内容为空，未导入");
+            return;
+        }
+        settingsPage.setSystemPromptText(value);
+        toast("已从" + source + "导入 " + value.length() + " 字，点「保存配置」生效");
+        selectTab(TAB_SETTINGS);
     }
 
     private void launchPackage(String pkg, String missingHint) {
@@ -313,6 +514,14 @@ public class MainActivity extends AppCompatActivity implements Pages.Actions {
             result.failed = status.optLong("failed", 0);
             result.autoRetries = status.optLong("auto_retries", 0);
             result.avgLatencyMs = status.optLong("avg_latency_ms", 0);
+            // v3.9 工具调用与心跳指标
+            result.toolRequests = status.optLong("tool_requests", 0);
+            result.toolCalls = status.optLong("tool_calls", 0);
+            result.lastToolNames = status.optString("last_tool_names", "");
+            result.heartbeatEnabled = status.optBoolean("heartbeat_enabled", false);
+            result.heartbeatIntervalMs = status.optInt("heartbeat_interval_ms",
+                    ConfigManager.DEFAULT_HEARTBEAT_INTERVAL_MS);
+            result.heartbeatTicks = status.optLong("heartbeat_ticks", 0);
             return result;
         }
 

@@ -71,6 +71,17 @@ public class OpenAIServer {
     private ExecutorService executor;
     private volatile boolean running;
 
+    /**
+     * v3.9 运行期启停。
+     *
+     * <p>悬浮球面板上的「网关开关」要在<b>不重启小布</b>的前提下立刻生效。
+     * 旧实现只有构造时 {@code start()} 一次，开关只能靠改配置 + 杀进程重启，
+     * 而「保活」恰恰又拦着不让小布自杀——两者叠加就变成了「关不掉」。
+     * 现在把 accept 线程做成可重新拉起/可中断的，{@code setEnabled} 直接
+     * 起停监听。</p>
+     */
+    private volatile Thread acceptThread;
+
     /** 并发闸门，容量取自配置的 max_concurrency */
     private volatile Semaphore concurrencyLimiter;
 
@@ -207,43 +218,118 @@ public class OpenAIServer {
         }
     }
 
+    /**
+     * v3.9 保留的薄封装：等价于 {@code setEnabled(true)}。
+     *
+     * <p>存在的意义是兼容 {@code MainHook} 里可能仍以「构建后立即启动」语义
+     * 调用它的路径，同时把「监听逻辑」收口到 {@link #setEnabled(boolean)} 一处，
+     * 避免两套启动代码各自漏掉某项（旧实现里真的漏过
+     * {@code GatewayStats.markListening}）。</p>
+     */
     public void start() throws IOException {
-        // 先 setReuseAddress 再 bind：进程重启后端口处于 TIME_WAIT 时也能立即复用，
-        // 避免偶发的 EADDRINUSE 让 HTTP Server 起不来。
-        serverSocket = new ServerSocket();
-        serverSocket.setReuseAddress(true);
-        serverSocket.bind(new java.net.InetSocketAddress(port));
-        executor = Executors.newCachedThreadPool();
-        running = true;
-
-        int maxConcurrency = ConfigManager.getMaxConcurrencyInTarget();
-        concurrencyLimiter = new Semaphore(maxConcurrency);
-        logBoth("Concurrency limit = " + maxConcurrency);
-
-        Thread acceptThread = new Thread(() -> {
-            while (running) {
-                try {
-                    Socket client = serverSocket.accept();
-                    executor.submit(() -> handleClient(client));
-                } catch (IOException e) {
-                    if (running) logBoth("Accept error: " + e.getMessage());
-                }
-            }
-        });
-        acceptThread.setDaemon(true);
-        acceptThread.start();
-        GatewayStats.reset();
-        GatewayStats.markListening("127.0.0.1", port);
-        logBoth("OpenAI-compatible server started on port " + port);
-        File lf = getLogFile();
-        logBoth("Log file = " + (lf != null ? lf.getAbsolutePath() : "(unavailable, logcat only)"));
+        if (!setEnabled(true)) {
+            throw new IOException("bind failed on port " + port);
+        }
     }
 
     public void stop() {
         running = false;
         try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
         if (executor != null) executor.shutdownNow();
+        acceptThread = null;
         logBoth("Server stopped");
+    }
+
+    // ==================== v3.9 运行期启停 ====================
+
+    /** 监听是否正在运行 */
+    public boolean isRunning() {
+        return running;
+    }
+
+    /**
+     * 运行期开关网关（悬浮球面板与设置页的「启用本地 API 服务」共用它）。
+     *
+     * <p>语义是<b>幂等</b>：已经开着再开、已经关着再关都是空操作。
+     * 关掉时连并发闸门一起置空——留着旧容量会让「关网关」在面板上看起来生效、
+     * 实际下一轮请求仍能拿到令牌。</p>
+     *
+     * @return 操作后是否处于运行状态
+     */
+    public synchronized boolean setEnabled(boolean enabled) {
+        if (enabled == running) {
+            return running;
+        }
+        if (enabled) {
+            try {
+                // 端口被上一轮 stop 占在 TIME_WAIT 时，setReuseAddress 让 bind 立刻成功
+                serverSocket = new ServerSocket();
+                serverSocket.setReuseAddress(true);
+                serverSocket.bind(new java.net.InetSocketAddress(port));
+                executor = Executors.newCachedThreadPool();
+                running = true;
+
+                // 并发容量在每次「启动」时按当前配置求值：用户在悬浮球面板上把
+                // 并发从 3 调到 8 之后，重新开关一次网关就该按 8 生效。
+                int maxConcurrency = ConfigManager.getMaxConcurrencyInTarget();
+                concurrencyLimiter = new Semaphore(maxConcurrency);
+
+                acceptThread = new Thread(() -> {
+                    while (running) {
+                        try {
+                            Socket client = serverSocket.accept();
+                            executor.submit(() -> handleClient(client));
+                        } catch (IOException e) {
+                            if (running) logBoth("Accept error: " + e.getMessage());
+                        }
+                    }
+                });
+                acceptThread.setDaemon(true);
+                acceptThread.start();
+                GatewayStats.reset();
+                GatewayStats.markListening("127.0.0.1", port);
+                logBoth("Gateway enabled on port " + port
+                        + " (concurrency=" + maxConcurrency + ")");
+                File lf = getLogFile();
+                logBoth("Log file = " + (lf != null ? lf.getAbsolutePath()
+                        : "(unavailable, logcat only)"));
+            } catch (Throwable t) {
+                running = false;
+                logBoth("Failed to enable gateway: " + t);
+            }
+        } else {
+            stop();
+        }
+        return running;
+    }
+
+    // ==================== v3.9 心跳保活支持 ====================
+
+    /**
+     * 监听存活自检：由 {@link GatewayWatchdog} 每次心跳调用。
+     *
+     * <p>专门抓一类只有主动检查才能发现的「僵尸网关」：accept 线程因异常退出了，
+     * 但 {@code running} 仍是 true —— 此时 {@code /status} 还能被前一轮已建立的
+     * 连接应答，端口上却已经没人 accept 新连接，表现成客户端随机连不上。</p>
+     *
+     * <p><b>不</b>在这里计心跳数：心跳次数的语义是「看门狗跳了几次」，
+     * 计入本类会在网关停用时停止累计，面板上就分不清「心跳关着」和
+     * 「心跳开着但网关停着」。计数统一由看门狗记。</p>
+     */
+    public void ensureListenerAlive() {
+        if (!running) {
+            return;
+        }
+        if (acceptThread == null || !acceptThread.isAlive()) {
+            logBoth("[heartbeat] accept thread is gone, restarting listener");
+            setEnabled(false);
+            setEnabled(true);
+        }
+    }
+
+    /** 监听端口 */
+    public int getPort() {
+        return port;
     }
 
     private void handleClient(Socket socket) {
@@ -626,6 +712,9 @@ public class OpenAIServer {
         boolean toolsRequest = tools != null && tools.length() > 0;
         String toolInjectText = null;
         if (toolsRequest) {
+            // v3.9 面板指标：工具调用请求单独计数，且必须在注入前记，
+            // 否则「注入失败但确实带了 tools」的请求会从计数里消失
+            GatewayStats.incrToolRequests();
             toolInjectText = ToolCallBridge.buildInjectText(
                     request, ConfigManager.getSystemPromptInTarget());
             logBoth("Tool request: tools=" + tools.length()
@@ -862,6 +951,26 @@ public class OpenAIServer {
      * 工具结果，不差这一小段时序差。真流式的价值在长文本回答上，那条路径
      * （无工具请求）保持原样未动。</p>
      */
+    /**
+     * v3.9 把「本轮回吐了几个 tool_calls、叫什么名字」记进运行统计。
+     *
+     * <p>三个响应路径（非流式 / 缓冲流式 / chunked）都会调用它，因此收口在这里，
+     * 避免出现「面板上某个路径的调用数永远为 0」这类只有特定客户端才暴露的偏差。</p>
+     */
+    private static void recordToolCalls(JSONArray calls) {
+        if (calls == null || calls.length() == 0) {
+            return;
+        }
+        GatewayStats.incrToolCalls(calls.length());
+        java.util.List<String> names = ToolCallBridge.callNames(calls);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < names.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(names.get(i));
+        }
+        GatewayStats.setLastToolNames(sb.toString());
+    }
+
     private Response buildBufferedToolStreamResponse(ConversationSession session, String requestId,
                                                      String format, JSONObject request) {
         if (!session.isCompleted()) {
@@ -878,6 +987,7 @@ public class OpenAIServer {
         String fullContent = session.getFullContent();
         String completionId = "chatcmpl-" + requestId;
         JSONArray calls = ToolCallBridge.extractCalls(request, fullContent);
+        recordToolCalls(calls);
         StringBuilder sb = new StringBuilder();
 
         // 首帧：声明角色（SDK 按它初始化 assistant 消息容器）
@@ -991,6 +1101,7 @@ public class OpenAIServer {
                 }
                 String full = session.getFullContent();
                 JSONArray calls = ToolCallBridge.extractCalls(request, full);
+                recordToolCalls(calls);
                 if (calls.length() > 0) {
                     logBoth("Tool calls parsed (chunked): " + calls.length()
                             + ", names=" + ToolCallBridge.callNames(calls));
@@ -1173,6 +1284,7 @@ public class OpenAIServer {
             // 只对 OpenAI 格式生效（见 handleChatCompletions 的说明）。
             if (toolsRequest && !"anthropic".equals(format) && !"legacy".equals(format)) {
                 JSONArray calls = ToolCallBridge.extractCalls(request, fullContent);
+                recordToolCalls(calls);
                 if (calls.length() > 0) {
                     logBoth("Tool calls parsed: " + calls.length()
                             + ", names=" + ToolCallBridge.callNames(calls));

@@ -33,10 +33,19 @@ public final class GatewayStats {
     private static final AtomicLong activeConnections = new AtomicLong();
     private static final AtomicLong injectedRounds = new AtomicLong();
     private static final AtomicLong totalLatencyMs = new AtomicLong();
+    /** v3.9 携带 tools 的请求数（工具调用请求） */
+    private static final AtomicLong toolRequests = new AtomicLong();
+    /** v3.9 回吐给客户端的 tool_calls 总数 */
+    private static final AtomicLong toolCalls = new AtomicLong();
+    /** v3.9 心跳 tick 次数（看门狗探活次数） */
+    private static final AtomicLong heartbeatTicks = new AtomicLong();
     private static final ConcurrentHashMap<String, AtomicLong> errorCounters = new ConcurrentHashMap<>();
 
     private static volatile long startedAt = System.currentTimeMillis();
     private static volatile long lastRequestAt;
+    private static volatile long lastToolCallAt;
+    private static volatile long lastHeartbeatAt;
+    private static volatile String lastToolNames = "";
     private static volatile String lastError = "";
     private static volatile String listeningHost = "127.0.0.1";
     private static volatile int listeningPort = ConfigManager.DEFAULT_PORT;
@@ -70,6 +79,40 @@ public final class GatewayStats {
 
     public static long incrInjectedRounds() {
         return injectedRounds.incrementAndGet();
+    }
+
+    // ==================== v3.9 工具调用 / 心跳 ====================
+
+    /**
+     * 记一次「携带 tools 的请求」。
+     *
+     * <p>工具调用请求与普通请求在面板上必须是两个数：只有 tools 请求才可能产出
+     * tool_calls，把两者混在一个「累计请求」里，用户无法判断 function calling
+     * 到底有没有被真正用上。</p>
+     */
+    public static long incrToolRequests() {
+        lastRequestAt = System.currentTimeMillis();
+        return toolRequests.incrementAndGet();
+    }
+
+    /** 记一次回吐的 tool_calls（一次请求可能回吐多个调用） */
+    public static long incrToolCalls(long count) {
+        if (count <= 0) {
+            return toolCalls.get();
+        }
+        lastToolCallAt = System.currentTimeMillis();
+        return toolCalls.addAndGet(count);
+    }
+
+    /** 记录最近一次回吐的调用名，便于面板/日志定位模型到底调了什么 */
+    public static void setLastToolNames(String names) {
+        lastToolNames = names == null ? "" : names;
+    }
+
+    /** 记一次心跳 tick（保活是否真的在跑，面板上要看得见） */
+    public static long incrHeartbeatTicks() {
+        lastHeartbeatAt = System.currentTimeMillis();
+        return heartbeatTicks.incrementAndGet();
     }
 
     public static long incrActive() {
@@ -136,6 +179,13 @@ public final class GatewayStats {
             o.put("auto_retries", autoRetries.get());
             o.put("active_connections", activeConnections.get());
             o.put("injected_rounds", injectedRounds.get());
+            // v3.9 工具调用运行指标：面板「运行状态」里的「工具调用请求」直接读它
+            o.put("tool_requests", toolRequests.get());
+            o.put("tool_calls", toolCalls.get());
+            o.put("last_tool_call_at", lastToolCallAt);
+            o.put("last_tool_names", lastToolNames);
+            o.put("heartbeat_ticks", heartbeatTicks.get());
+            o.put("last_heartbeat_at", lastHeartbeatAt);
             o.put("avg_latency_ms", requests.get() > 0
                     ? totalLatencyMs.get() / Math.max(1, requests.get()) : 0);
             o.put("last_request_at", lastRequestAt);
@@ -156,6 +206,9 @@ public final class GatewayStats {
             o.put("auto_retry_enabled", ConfigManager.isAutoRetryEnabledInTarget());
             o.put("auto_retry_max", ConfigManager.getAutoRetryMaxInTarget());
             o.put("request_timeout_ms", ConfigManager.getRequestTimeoutMsInTarget());
+            // v3.9 心跳保活：UI 侧要把「保活到底跑没跑」显示出来，所以把实时值一起导出
+            o.put("heartbeat_enabled", ConfigManager.isHeartbeatEnabledInTarget());
+            o.put("heartbeat_interval_ms", ConfigManager.getHeartbeatIntervalMsInTarget());
             o.put("version", BuildConfig.VERSION_NAME);
 
             JSONObject errs = new JSONObject();
@@ -191,6 +244,12 @@ public final class GatewayStats {
         activeConnections.set(0);
         injectedRounds.set(0);
         totalLatencyMs.set(0);
+        toolRequests.set(0);
+        toolCalls.set(0);
+        heartbeatTicks.set(0);
+        lastToolCallAt = 0;
+        lastHeartbeatAt = 0;
+        lastToolNames = "";
         errorCounters.clear();
         startedAt = System.currentTimeMillis();
         lastError = "";
