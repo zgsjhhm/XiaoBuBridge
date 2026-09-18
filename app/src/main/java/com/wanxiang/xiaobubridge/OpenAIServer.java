@@ -722,23 +722,10 @@ public class OpenAIServer {
                     + ", injectText=" + toolInjectText.length() + "c");
         }
 
-        // v3.6 自动唤醒：小布在后台时注入不报错但零回调，必须先拉到前台。
-        // 放在锁外：唤醒期间可能涉及 Activity 启动，没必要占着对话框锁。
-        if (userMsg != null && !userMsg.isEmpty() && ConfigManager.isAutoWakeEnabledInTarget()) {
-            long wakeStart = System.currentTimeMillis();
-            boolean foreground = AutoWaker.ensureForeground();
-            logBoth("AutoWake result=" + foreground
-                    + ", cost=" + (System.currentTimeMillis() - wakeStart) + "ms");
-            if (!foreground) {
-                GatewayStats.countError("not_foreground");
-                // 用 503 而不是 200：这是「暂时不可用、重试可能成功」，客户端网关与
-                // OpenAI SDK 都能据此走重试逻辑；塞在 200 里会被当成正常回答内容。
-                return new Response(503, "application/json",
-                        "{\"error\":{\"message\":\"XiaoBu is not in foreground and could not be woken. "
-                                + "Unlock the screen or open XiaoBu once, then retry.\","
-                                + "\"type\":\"service_unavailable\"}}");
-            }
-        }
+        // v3.13 后台静默：这里不再做「请求前无条件唤醒」。
+        // v3.6 的原假设「小布在后台 → 注入零回调」经真机取证不成立（见 runInjectedRound
+        // 之外的降级逻辑）：后台注入在锁屏 / 流式 / 多轮 / tools 场景下均能拿到回调。
+        // 唤醒改为「零回调时降级」，放在对话框锁内按轮次决定，避免每次都把小布拽到前台。
 
         // 每个 HTTP 请求都必须先切断上一轮；否则复用 recordId 时会把旧回答当成本轮结果。
         // 小布只有一个对话框、回调不带 requestId，故整轮（建屏障 → 注入 → 消费回答）
@@ -748,6 +735,16 @@ public class OpenAIServer {
             int maxRetry = ConfigManager.isAutoRetryEnabledInTarget()
                     ? ConfigManager.getAutoRetryMaxInTarget() : 0;
             ConversationSession session = null;
+
+            // v3.13 后台静默：唤醒从「请求前无条件执行」改为「零回调后降级执行」。
+            // 后台注入（引擎已就绪时）实测可直接拿到回调，无需把小布拽到前台；
+            // 真正的失败场景是「小布进程刚起、对话引擎尚未预热」——此时后台首轮
+            // 必然零回调。故降级放在**首轮**零回调之后，而不是等所有退避重试耗尽
+            // （默认 maxRetry=3 × 60s 超时会让冷启动请求白等 4 分钟才唤起）。
+            boolean hasText = userMsg != null && !userMsg.isEmpty();
+            boolean allowWake = hasText && ConfigManager.isAutoWakeEnabledInTarget();
+            boolean wakeAttempted = false;
+            boolean wakeFailed = false;
 
             // 重试语义：只有「注入成功但零回调」才重试。这类失败是小布的偶发丢回调，
             // 重来一轮通常能成。会话已产生内容但未 completed 属于正在生成，不能重试
@@ -761,6 +758,29 @@ public class OpenAIServer {
                     }
                     break;
                 }
+
+                // 首轮零回调即降级：拉前台后立刻重试一次（这是冷启动/引擎未就绪的
+                // 典型形态，继续在后台空耗退避窗口没有意义）。锁屏下唤醒会失败，
+                // 此时直接放弃并返回 503，不做无意义的多轮重试。
+                if (allowWake && !wakeAttempted) {
+                    wakeAttempted = true;
+                    long wakeStart = System.currentTimeMillis();
+                    boolean foreground = AutoWaker.ensureForeground();
+                    logBoth("No callback in background round; fallback AutoWake result=" + foreground
+                            + ", cost=" + (System.currentTimeMillis() - wakeStart) + "ms");
+                    if (!foreground) {
+                        GatewayStats.countError("not_foreground");
+                        wakeFailed = true;
+                        break;
+                    }
+                    GatewayStats.incrAutoRetries();
+                    ConversationSession.beginExternalRound();
+                    session = runInjectedRound(requestId, userMsg, toolInjectText);
+                    if (session != null) {
+                        break;
+                    }
+                }
+
                 if (attempt < maxRetry) {
                     logBoth("No callback on attempt " + (attempt + 1) + "/" + (maxRetry + 1)
                             + ", retrying after backoff");
@@ -774,6 +794,16 @@ public class OpenAIServer {
             }
 
             if (session == null) {
+                if (wakeFailed) {
+                    // 唤醒也失败了（多为锁屏 / 系统拦截后台拉起）。返回 503 而不是 200：
+                    // 这是「暂时不可用、重试可能成功」，客户端与 OpenAI SDK 能据此走重试，
+                    // 塞在 200 里会被当成正常回答内容。
+                    logBoth("No callback and AutoWake failed; returning 503 not_foreground");
+                    return new Response(503, "application/json",
+                            "{\"error\":{\"message\":\"XiaoBu is not in foreground and could not be woken. "
+                                    + "Unlock the screen or open XiaoBu once, then retry.\","
+                                    + "\"type\":\"service_unavailable\"}}");
+                }
                 GatewayStats.countError("no_callback");
                 logBoth("No active conversation after retries, returning error body");
                 // 保留 200 + error 体：与旧版行为一致，避免破坏既有客户端；

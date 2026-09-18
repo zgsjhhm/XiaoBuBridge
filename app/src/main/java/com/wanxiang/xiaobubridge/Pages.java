@@ -266,8 +266,8 @@ final class Pages {
             swChunked = UIKit.switchRow(svc, ctx, "真流式输出（chunked 分片下发）",
                     "边收边发，客户端可逐字显示；关闭则等整段回答结束再一次性返回",
                     ConfigManager.DEFAULT_CHUNKED_STREAM_ENABLED);
-            swAutoWake = UIKit.switchRow(svc, ctx, "请求到达时自动唤醒小布",
-                    "小布在后台时注入收不到回调，需先拉到前台；锁屏状态下无法唤起",
+            swAutoWake = UIKit.switchRow(svc, ctx, "后台失败时回退唤醒小布",
+                    "默认后台静默调用（不弹出小布界面）；仅当后台整轮收不到回调时才拉前台重试一次",
                     ConfigManager.DEFAULT_AUTO_WAKE_ENABLED);
             swKeepAlive = UIKit.switchRow(svc, ctx, "保活（拦截小布的自动退出）",
                     "小布空闲约 90 秒会自杀，开启后常驻后台",

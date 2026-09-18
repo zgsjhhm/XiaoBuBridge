@@ -36,16 +36,20 @@ android {
         //       并清空该包全部闹钟——v3.10 靠闹钟复活的路径因此天然失效。改为挂在
         //       「小布进程按需拉起模块进程」这条稳定路径上自愈：ConfigProvider 在
         //       process 启动与每次 query 时按配置补一次 OverlayBallService。
+        // v3.13：API 调用改为后台静默——小布进程存活时直接后台注入并拿回调，
+        //       不再每次请求前把 SpeechAssistMainActivity 拉到前台；仅当后台整轮
+        //       零回调且开启「自动唤醒」时，才拉前台兜底重试一次（失败返回 503）。
+        //       真机取证推翻了 v3.6 的假设「后台注入零回调」（锁屏/流式/多轮/tools 均可）。
         // ---- 版本通道（v3.12 起）----
-        // 正式版（GitHub Release）：versionName "3.12"       / versionCode 31200
-        // 本地测试版（-Pchannel=local）：versionName "3.12.99-local" / versionCode 31299
+        // 正式版（GitHub Release）：versionName "3.13"       / versionCode 31300
+        // 本地测试版（-Pchannel=local）：versionName "3.13.99-local" / versionCode 31399
         //   patch 固定取 99：测试版号恒高于同一 patch 的正式版（可覆盖安装正式版做验证），
-        //   又恒低于下一个次版本正式版（3.13 -> 31300），不会把后续正式升级挡在门外。
+        //   又恒低于下一个次版本正式版（3.14 -> 31400），不会把后续正式升级挡在门外。
         // 默认走 release：漏传参数时宁可产出正式号，也不能让测试号混进发布产物——
-        // 测试号 31299 一旦发出，会把正式版 31200 反过来挡在安装门外。
+        // 测试号 31399 一旦发出，会把正式版 31300 反过来挡在安装门外。
         val channel = (project.findProperty("channel") as String?) ?: "release"
-        val officialCode = 31200
-        val officialName = "3.12"
+        val officialCode = 31300
+        val officialName = "3.13"
         if (channel == "local") {
             versionCode = officialCode + 99
             versionName = "$officialName.99-local"
