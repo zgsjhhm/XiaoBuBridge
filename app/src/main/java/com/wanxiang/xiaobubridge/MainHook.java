@@ -309,6 +309,12 @@ public class MainHook implements IXposedHookLoadPackage {
                         + ", length=" + content.length());
             }
 
+            // v3.15 文生图取图：图片 URL 不在 content 里，而在 bean 的 payload
+            // （或部分版本的 markdownCardInfos）中。正文此时只有「已生成图片」几个字，
+            // 所以这一步必须独立于 content 是否为空来判断——被吞轮里 content 为空、
+            // payload 仍可能带着上一轮残留，交由会话的轮次屏障与 URL 去重挡掉。
+            offerImagesFromBean(session, bean, from);
+
             if (reasoningContent != null && !reasoningContent.isEmpty()) {
                 XposedBridge.log(TAG + " [" + from + "] Reasoning fragment for " + sessionKey
                         + ", length=" + reasoningContent.length());
@@ -322,6 +328,56 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " handleBean(" + from + ") error: " + t);
         }
+    }
+
+    /**
+     * 从 bean 的 UI 指令载荷里抽取图片结果并投递进会话（v3.15）。
+     *
+     * <p>两条通道都扫，任一命中即可：</p>
+     * <ol>
+     *   <li>{@code AIChatViewBean.payload}（协议正路，实测文生图走这条）；</li>
+     *   <li>{@code AIChatViewBean.markdownCardInfos}（部分版本的兜底通道）。</li>
+     * </ol>
+     *
+     * <p>解析全部交给 {@link ImageResultCodec}：它是纯逻辑类、有离线回归，
+     * 版本差异与脏数据都在那里收敛，本方法只负责「取字段 → 投递」。
+     * 任何异常都吞掉——Hook 跑在小布主进程里，绝不能因为抽图失败带崩宿主。</p>
+     */
+    private static void offerImagesFromBean(ConversationSession session, Object bean, String from) {
+        try {
+            String payload = BeanExtractor.getPayload(bean);
+            java.util.List<String> cards = BeanExtractor.getMarkdownCardInfos(bean);
+            if ((payload == null || payload.isEmpty()) && (cards == null || cards.isEmpty())) {
+                return;
+            }
+            // 流式回答的每一片都会走到这里。payload 一旦非空（推荐卡、文本卡也会带），
+            // 逐片做完整 JSON 解析既浪费又没意义——图片 URL 的字段名是稳定的，
+            // 先用一次廉价子串判定挡掉绝大多数非图片轮次，再做解析。
+            boolean maybeImage = (payload != null && payload.contains("picUrl"))
+                    || containsPicUrl(cards);
+            if (!maybeImage) {
+                return;
+            }
+            java.util.List<ImageResultCodec.ImageResult> images =
+                    ImageResultCodec.extractAll(payload, cards);
+            if (images.isEmpty()) {
+                return;
+            }
+            int added = session.offerImages(images);
+            if (added > 0) {
+                XposedBridge.log(TAG + " [" + from + "] Offered " + added + " image(s) to session");
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " offerImagesFromBean(" + from + ") error: " + t);
+        }
+    }
+
+    private static boolean containsPicUrl(java.util.List<String> cards) {
+        if (cards == null) return false;
+        for (String c : cards) {
+            if (c != null && c.contains("picUrl")) return true;
+        }
+        return false;
     }
 
     /**

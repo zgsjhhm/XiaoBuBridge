@@ -267,7 +267,8 @@ final class Pages {
                     "边收边发，客户端可逐字显示；关闭则等整段回答结束再一次性返回",
                     ConfigManager.DEFAULT_CHUNKED_STREAM_ENABLED);
             swAutoWake = UIKit.switchRow(svc, ctx, "后台失败时回退唤醒小布",
-                    "默认后台静默调用（不弹出小布界面）；仅当后台整轮收不到回调时才拉前台重试一次",
+                    "默认后台静默调用（不弹出小布界面）；仅当首轮探测判定引擎没接单时，"
+                            + "才拉一次前台并用完整超时重试",
                     ConfigManager.DEFAULT_AUTO_WAKE_ENABLED);
             swKeepAlive = UIKit.switchRow(svc, ctx, "保活（拦截小布的自动退出）",
                     "小布空闲约 90 秒会自杀，开启后常驻后台",
@@ -580,9 +581,10 @@ final class Pages {
                             + "4. 隐藏悬浮球后，仍可在模块 App 设置页重新开启");
             UIKit.divider(usage, ctx);
             UIKit.hint(usage, ctx,
-                    "小布必须处于前台才能应答：后台时注入不会触发任何回调。"
-                            + "开启设置页的「请求到达时自动唤醒小布」可自动处理，"
-                            + "锁屏状态下则无法唤起。",
+                    "小布无需处于前台：进程存活时后台注入即可拿到回答（锁屏亦然）。"
+                            + "偶发的「首次注入被引擎吞掉」会由首轮探测自动降级重试；"
+                            + "开启设置页的「后台失败时回退唤醒小布」后，降级会拉一次前台，"
+                            + "锁屏下则无法唤起并返回 503。",
                     0);
             page.addView(usage);
 

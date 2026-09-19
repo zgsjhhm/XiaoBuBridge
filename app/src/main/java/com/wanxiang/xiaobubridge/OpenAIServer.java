@@ -55,6 +55,84 @@ public class OpenAIServer {
     private static final long RETRY_BACKOFF_MS = 800L;
     /** 请求读取阶段超时：正常客户端应瞬时发完请求，超时即视为异常连接 */
     private static final long REQUEST_READ_TIMEOUT_MS = 20 * 1000L;
+
+    /**
+     * 首轮「引擎是否接单」探测窗口（v3.14）。
+     *
+     * <p>真机数据显示：注入零回调是<b>概率性</b>的，形态是引擎吞掉首次注入——
+     * {@code injectUserMessage result=true} 之后窗口内零回调，连 {@code chatType=1}
+     * 用户回显都没有；引擎「接单」时延（inject→accepted）实测 92 次
+     * <b>1.53–7.01s</b>、中位 2.51s（含正常轮）。旧实现对此一律硬等满
+     * {@code request_timeout}（默认 60s）才降级：v3.13 发布版单次被吞轮实测
+     * <b>62.75–65.16s</b>（6 轮）、一轮连吞两次 126.42s，
+     * 而正常轮只有 2.3–4.0s（76 轮 sweep 实测区间 2.346–3.951s）。</p>
+     *
+     * <p><b>发生率只给定性（据实）</b>：被吞是概率性的，且<b>日志不打印版本号</b>
+     * （只能按日志形态断代），发生率又与工况相关，因此给不出稳定的「百分比常数」。冻结快照
+     * （17061 行，2026-09-18 11:10）上两个可直接 grep 复现的计数：
+     * 450 个进入对话处理的请求中，28 个至少被吞一次（6.2%）；
+     * 453 次注入中 47 次被吞（10.4%）。量级为百分之几到一成。
+     * 早期小结的「44 轮 7 轮 ≈ 16%」样本过小且无留存证据，不再引用。
+     * 这里只保留定性：<b>低频、概率性、不可预测</b>，且与前后台、
+     * 与空闲时长均<b>无</b>单调关系（受控 sweep 已证）。</p>
+     *
+     * <p>所以首轮先用本窗口快判「有没有接单」：窗口内既无内容产出、也没有本轮
+     * 会话被登记，即认定引擎吞了这次注入，立即走降级/重试，而不是空耗满超时。
+     * 15s 相对受控 sweep 的正常轮（2.3–4.0s）有 3 倍以上余量，
+     * 也高于引擎接单时延实测上界 7.01s；慢回答不靠这个窗口兜底（见下面的接单延长）。</p>
+     *
+     * <p><b>代价据实分列（v3.14 真机实测）</b>：被吞轮的耗时取决于降级路径，
+     * 不是一个区间能概括的——
+     * <ul>
+     *   <li>冷启动（force-stop 小布后重开新网关）：<b>16.9s</b>
+     *       （15.04 探测 + 0.23 唤醒 + 1.53 接单），200；</li>
+     *   <li><b>最坏</b>：唤醒后的完整窗口重试<b>也被吞</b> →
+     *       整轮 REQ→RESP 实测 <b>80.19s</b>，分段为 15.03 探测 + 0.26 唤醒
+     *       + 60.08 完整窗口重试 + 0.83 退避 + 3.53 重注入到接单；</li>
+     *   <li>关闭自动唤醒：4 轮探测 + 3 次退避 = 实测 <b>62.58s</b> 后放弃
+     *       （4×15.03 探测 + 3×0.83 退避 ≈ 62.5s），返回 upstream_error。</li>
+     * </ul>
+     * 发生在 v3.13→v3.14 之间的<b>中间构建</b>上还有一轮 21.16s
+     * （15.08 探测 + 0.24 唤醒 + 5.7 重注入到出内容，日志已是 15s 探测窗口
+     * 但唤醒行仍是旧格式 {@code fallback AutoWake result=}）。
+     * 与 v3.13 对照<b>必须按同一形态比</b>（否则会拿「两次连吞」去比「单次被吞」）：
+     * v3.13 发布版单次被吞轮实测 62.75–65.16s（6 轮：62.75 / 63.14 / 64.40 /
+     * 64.65 / 64.88 / 65.16），连吞两次 126.42s。
+     * 也就是说 v3.14 的单次被吞探测代价是固定的 15s + 唤醒 + 重注入
+     * （实测 16.90s / 中间构建 21.16s），与 v3.13 的「等满 60s 才降级」不同量级
+     * （v3.13 发布说明记的冷启动是 35s / 62s 两次实测）；
+     * 而 v3.14 的 80.19s 对应的是「探测被吞 + 唤醒后完整窗口重试又被吞」，
+     * 与 v3.13 的单次被吞轮 <b>同量级、未获改善</b>——因为唤醒后的重试仍给足
+     * 完整 60s 窗口（刻意保守，见降级处注释）。
+     * （更早的 v3.12 段已送达的被吞轮只有单次被吞 60.17 / 68.77 / 80.61s 三轮；
+     * 该段其余 12 轮（1 次或 2 次被吞）在完成瞬间客户端已断开
+     * （{@code Broken pipe}，响应未送达），不以往返耗时论。
+     * 另有 1 轮（v3.13 的 0a93bc21，吞 3 次）既无 RESP 也无 Broken pipe：
+     * 其等待期间我在测试中用悬浮球开关重启了一次网关
+     * （{@code setEnabled} 会 {@code executor.shutdownNow()} 中断在途请求），
+     * 属测试操作打断，非 v3.13 自身形态，亦不计入。
+     * 那是「请求前无条件唤醒」叠加多轮退避的形态，与 v3.13 起的设计不同，
+     * 不作同形态对照，仅备查。）尾部延迟不该被「整体变快」掩盖，
+     * 故按形态分列，且不把 80.19s 说成「比 v3.13 更慢」。</p>
+     *
+     * <p><b>残留风险（据实记录，不粉饰）</b>：若小布正常接单但<b>首字延迟</b>
+     * 超过 15s（超长思考 / 上游慢），会被误判为「没接单」而多走一次降级
+     * ——若此时小布恰在前台，降级只是空操作后重注入，代价是小布对话历史里
+     * 多一条重复提问。已接单（本轮会话被登记）的情形不在此列，见
+     * {@link #waitForActiveSession} 的 accepted 延长逻辑。</p>
+     */
+    private static final long FIRST_ROUND_PROBE_MS = 15 * 1000L;
+
+    /**
+     * 首轮探测窗口的实际取值：不超过用户配置的单次请求超时。
+     *
+     * <p>用户把 request_timeout 调到 10s 时，探测窗口若固定 15s 反而比整体超时还长，
+     * 语义就反了。这里取两者的较小值。</p>
+     */
+    private static long firstRoundProbeMs() {
+        return Math.min(FIRST_ROUND_PROBE_MS, ConfigManager.getRequestTimeoutMsInTarget());
+    }
+
     /**
      * 流式/非流式等待内容时的轮询粒度（v3.4）。
      * 会话队列必须按这个粒度取，不能用 ConversationSession 内部 60 秒的阻塞轮询，
@@ -63,6 +141,66 @@ public class OpenAIServer {
     private static final long POLL_GRANULARITY_MS = 50L;
     /** 落盘日志文件名（写在小布应用私有目录，root 可读） */
     private static final String LOG_FILE_NAME = "xiaobubridge_http.log";
+
+    // ==================== v3.15 文生图 ====================
+
+    /**
+     * 生图意图前缀：OpenAI 的 images 端点语义本身就含「生成图片」，
+     * 但客户端 prompt 通常只有画面描述，裸描述会被小布当普通问答回答。
+     * 见 {@link #buildImagePrompt} 的说明（这一步是推断，真机验证负责证伪）。
+     */
+    private static final String IMAGE_INTENT_PREFIX = "画一张图：";
+
+    /** prompt 里已含这些动词时不再叠加生图前缀（避免「画一张图：画一只猫」） */
+    private static final java.util.regex.Pattern DRAW_INTENT = java.util.regex.Pattern.compile(
+            "(画一|画个|画张|画幅|帮我画|生成图|生成一张|绘制|作图|来一张|来张图|draw|generate an image|paint)");
+
+    /**
+     * 一次请求最多出几张图。
+     *
+     * <p>小布一轮只出一张，n&gt;1 只能串行跑 n 轮。上限压到 4：生图单轮实测
+     * 16.06s，再多会把客户端拖到分钟级，且全程占着对话框锁让对话请求排队。</p>
+     *
+     * <p><b>诚实标注</b>：n&gt;1 的实际产出常低于请求值。背靠背注入（间隔约 20ms）
+     * 时第 2 轮起会被引擎丢掉并由纯文本回答顶替，实测 n=2 稳定只拿到 1 张；
+     * 此时端点<b>静默按 200 返回已拿到的张数</b>（不报错、不补齐）。间隔
+     * ≥6s 的独立请求则稳定成功——但那个间隔已经抵掉「一轮多图」的意义，
+     * 故此处不假装能给出 n 张。详见 {@code verify_image_device.py} 与 README。</p>
+     */
+    private static final int MAX_IMAGE_N = 4;
+
+    /**
+     * 生图轮的探测窗口。
+     *
+     * <p>比对话轮的 {@link #FIRST_ROUND_PROBE_MS}（15s）更长：生图的「接单」
+     * 本身就是先调云端再回图，引擎发出 {@code chatType=1} 回显的时延不确定，
+     * 用 15s 会把正常慢启动误判成被吞，然后重注入——正好撞上小布自己的
+     * 「当前已有生图任务正在进行」。</p>
+     */
+    private static final long IMAGE_PROBE_MS = 30 * 1000L;
+
+    /**
+     * 生图轮的完整等待上限（引擎接单后延长到此值）。
+     *
+     * <p>不跟随 {@code request_timeout}：那个默认 60s 是给文本轮定的，
+     * 生图实测单轮 16.06s 只是「一次成功」的样本，云端排队时会显著更长。
+     * 给 180s 留足余量；客户端要更短可自行设 HTTP 超时，网关不会中途截断。</p>
+     */
+    private static final long IMAGE_FULL_TIMEOUT_MS = 180 * 1000L;
+
+    /** 图片下载连接/读取超时：CDN 直链实测秒级可取，给 10s 足够 */
+    private static final int IMAGE_DOWNLOAD_CONNECT_TIMEOUT_MS = 10 * 1000;
+    private static final int IMAGE_DOWNLOAD_READ_TIMEOUT_MS = 30 * 1000;
+    /** 单张图上限：base64 内联会放大 4/3，32MB 已远超正常出图体积（实测 ~108KB） */
+    private static final int IMAGE_DOWNLOAD_MAX_BYTES = 32 * 1024 * 1024;
+    /**
+     * 图片直链的「等回源」预算。
+     *
+     * <p>实测载荷到达后 4–9s 才可读，取 3 倍余量到 20s；配合 1s 间隔约 20 次尝试。
+     * 这是确定性等待，不是赌博式重试：URL 已由载荷给出，只是对象还没落 CDN。</p>
+     */
+    private static final long IMAGE_DOWNLOAD_RETRY_BUDGET_MS = 20 * 1000L;
+    private static final long IMAGE_DOWNLOAD_RETRY_INTERVAL_MS = 1000L;
 
     private static volatile File logFile;
 
@@ -462,6 +600,14 @@ public class OpenAIServer {
                         return;
                     }
                 }
+            } else if ("/v1/images/generations".equals(uri) && "POST".equalsIgnoreCase(method)) {
+                if (!openAiFormatEnabled()) {
+                    resp = formatDisabled("OpenAI");
+                } else if (!checkApiKey(headers)) {
+                    resp = unauthorized();
+                } else {
+                    resp = handleImageGenerations(body);
+                }
             } else {
                 resp = new Response(404, "application/json",
                         "{\"error\":{\"message\":\"Not Found\",\"type\":\"invalid_request_error\"}}");
@@ -572,6 +718,11 @@ public class OpenAIServer {
             data.put(modelEntry("xiaobu", "oppo-xiaobu"));
             data.put(modelEntry("xiaobu-anthropic", "oppo-xiaobu"));
 
+            // v3.15：文生图模型条目。它不是「另一个后端模型」，而是
+            // /v1/images/generations 走同一个小布底座（skill=text2image）。
+            // 单独列出来是为了让只认 /v1/models 的客户端也能发现这条能力。
+            data.put(modelEntry("xiaobu-image", "oppo-xiaobu"));
+
             JSONObject result = new JSONObject();
             result.put("object", "list");
             result.put("data", data);
@@ -659,6 +810,470 @@ public class OpenAIServer {
     }
 
     /**
+     * 文生图端点（v3.15）。
+     *
+     * <p><b>为什么这么实现</b>：小布本身有文生图能力，但结果不在正文里——正文只有
+     * 「已生成图片」几个字，图片 URL 在回答 bean 的 {@code payload} 里
+     * （{@code MyAI.PictureCard.picUrl}，真机数据与 dex 均已核实）。
+     * 本端点把「注入文生图意图 → 等待 → 从 payload 抽图 → 转成 OpenAI 契约」
+     * 这条链路补齐，取图逻辑见 {@link ImageResultCodec}。</p>
+     *
+     * <p><b>参数支持边界（据实，不假装支持）</b>：</p>
+     * <ul>
+     *   <li>{@code prompt}：必需；</li>
+     *   <li>{@code n}：支持，但小布一轮只出一张图，故按轮串行执行
+     *       （上限 {@value #MAX_IMAGE_N}）。<b>实际产出常低于请求值</b>：
+     *       背靠背注入时第 2 轮起会被引擎丢掉，此时静默返回已拿到的张数；</li>
+     *   <li>{@code response_format}：{@code b64_json}（默认）或 {@code url}；</li>
+     *   <li>{@code size} / {@code quality} / {@code style}：<b>只记日志、不生效</b>
+     *       —— 小布侧不接受这些参数，出图尺寸由它自己按 {@code aspectRatio} 决定。
+     *       谎称支持会让调用方以为尺寸可控。</li>
+     * </ul>
+     *
+     * <p><b>为什么默认 {@code b64_json}</b>：小布 CDN 直链是回源地址（实测可匿名
+     * 下载），但既可能过期、也不属于「网关自己的托管地址」。默认内联 base64
+     * 让响应自包含；显式要 {@code url} 时才把上游直链原样给出。</p>
+     *
+     * <p><b>上游配额（排查要点）</b>：小布文生图有<b>每日配额</b>，用尽后引擎不再出图
+     * 而是回一句纯文本「已达到今日图片创作服务上限，请明日再试。」，本端点据实返回
+     * {@code 502 upstream_error}。密集压测会提前打满配额，之后当日内连单发 {@code n=1}
+     * 也稳定失败。要与「技能没路由」区分开：往 {@code /v1/chat/completions} 发同一句
+     * 生图意图，能拿到那句上限提示即说明是配额用尽（此时普通问答仍正常）。</p>
+     *
+     * <p><b>并发</b>：与对话端点共用 {@link #dialogLock}。小布的对话框与生图任务
+     * 都只有一份，并发注入会让两个请求认领同一份结果，也会撞上小布自己的
+     * 「当前已有生图任务正在进行」。串行是唯一正确的做法，代价是生图期间对话
+     * 请求会排队。</p>
+     */
+    private Response handleImageGenerations(String body) {
+        JSONObject request;
+        try {
+            request = new JSONObject(body);
+        } catch (Exception e) {
+            GatewayStats.countError("invalid_json");
+            return errorResponse(400, "Invalid JSON", "invalid_request_error");
+        }
+
+        String prompt = optNonEmpty(request, "prompt");
+        if (prompt == null) {
+            GatewayStats.countError("image_no_prompt");
+            return errorResponse(400, "Missing required field: prompt", "invalid_request_error");
+        }
+
+        String responseFormat = optNonEmpty(request, "response_format");
+        boolean wantB64;
+        if (responseFormat == null || "b64_json".equalsIgnoreCase(responseFormat)) {
+            wantB64 = true;
+        } else if ("url".equalsIgnoreCase(responseFormat)) {
+            wantB64 = false;
+        } else {
+            GatewayStats.countError("image_bad_format");
+            return errorResponse(400, "Unsupported response_format: " + responseFormat
+                    + " (only b64_json|url)", "invalid_request_error");
+        }
+
+        int n = request.optInt("n", 1);
+        if (n < 1) {
+            n = 1;
+        }
+        if (n > MAX_IMAGE_N) {
+            logBoth("Image request: n=" + n + " clamped to " + MAX_IMAGE_N);
+            n = MAX_IMAGE_N;
+        }
+
+        logBoth("Image request: n=" + n + ", model=" + request.opt("model")
+                + ", size=" + request.opt("size") + ", quality=" + request.opt("quality")
+                + ", style=" + request.opt("style")
+                + ", response_format=" + (wantB64 ? "b64_json" : "url")
+                + ", promptLen=" + prompt.length());
+
+        GatewayStats.incrRequests();
+        GatewayStats.incrActive();
+        long startedAt = System.currentTimeMillis();
+        Semaphore limiter = concurrencyLimiter;
+        boolean acquired = false;
+        if (limiter != null) {
+            acquired = limiter.tryAcquire();
+            if (!acquired) {
+                GatewayStats.decrActive();
+                GatewayStats.incrFailed();
+                GatewayStats.countError("concurrency_limit");
+                logBoth("Rejected image request: concurrency limit reached");
+                return errorResponse(429, "Too many concurrent requests", "rate_limit_error");
+            }
+        }
+        try {
+            // 第一段（持锁）：只做注入与等待，把图片结果收集出来。
+            // 下载与 base64 编码放在锁外——那是最耗时且与对话框无关的部分，
+            // 压在锁里会让后续对话请求无谓排队。
+            java.util.List<ImageResultCodec.ImageResult> images = new java.util.ArrayList<>();
+            String stopError = null;
+            String stopType = null;
+
+            dialogLock.lock();
+            try {
+                for (int i = 0; i < n && images.size() < n; i++) {
+                    String requestId = UUID.randomUUID().toString().replace("-", "");
+                    String injectText = buildImagePrompt(prompt);
+                    ConversationSession session = runImageRound(requestId, injectText);
+                    if (session == null) {
+                        // 与对话端点同语义：拿不到本轮会话要么是「引擎吞了注入且唤醒
+                        // 失败」，要么是「重试耗尽仍零回调」。
+                        if (lastImageRoundWakeFailed) {
+                            stopError = "XiaoBu is not in foreground and could not be woken. "
+                                    + "Unlock the screen or open XiaoBu once, then retry.";
+                            stopType = "service_unavailable";
+                        } else {
+                            stopError = "No active conversation while generating image";
+                            stopType = "upstream_error";
+                        }
+                        break;
+                    }
+                    GatewayStats.incrInjectedRounds();
+                    java.util.List<ImageResultCodec.ImageResult> got = session.drainImages();
+                    if (got.isEmpty()) {
+                        // 引擎接单了但没有图片载荷：多半是小布把这条当成普通问答回答
+                        // （没走文生图技能）。据实报错，不拿正文糊弄成「图片」。
+                        stopError = "XiaoBu answered without an image payload"
+                                + " (text-only answer; the prompt may not have been routed "
+                                + "to the text2image skill)";
+                        stopType = "upstream_error";
+                        break;
+                    }
+                    // 上游一轮可能给多张（如连环画）；按客户端要的张数截断，
+                    // 不多给也不假装只出了一张。
+                    for (ImageResultCodec.ImageResult img : got) {
+                        if (images.size() >= n) {
+                            break;
+                        }
+                        images.add(img);
+                    }
+                }
+            } finally {
+                dialogLock.unlock();
+            }
+
+            if (images.isEmpty()) {
+                GatewayStats.incrFailed();
+                GatewayStats.countError("image_no_result");
+                GatewayStats.setLastError(stopError);
+                logBoth("Image generation failed: " + stopError);
+                if ("service_unavailable".equals(stopType)) {
+                    return errorResponse(503, stopError, "service_unavailable");
+                }
+                return errorResponse(502, stopError, "upstream_error");
+            }
+
+            // 第二段（锁外）：按 response_format 组装响应体
+            JSONArray data = new JSONArray();
+            for (ImageResultCodec.ImageResult img : images) {
+                JSONObject item = new JSONObject();
+                if (wantB64) {
+                    try {
+                        byte[] bytes = downloadImageBytes(img.url);
+                        item.put("b64_json", android.util.Base64.encodeToString(
+                                bytes, android.util.Base64.NO_WRAP));
+                    } catch (Exception e) {
+                        // 下载失败不能静默降级成 url：调用方明确要的是 base64，
+                        // 给回一个 url 字段它读不到，反而更难定位。
+                        GatewayStats.incrFailed();
+                        GatewayStats.countError("image_download");
+                        GatewayStats.setLastError(String.valueOf(e.getMessage()));
+                        logBoth("Image download failed: " + e + ", url=" + img.url);
+                        return errorResponse(502, "Failed to download generated image: "
+                                + e.getMessage(), "upstream_error");
+                    }
+                } else {
+                    // OpenAI 契约里 url 是「回源下载地址」。这里是上游 CDN 直链，
+                    // 语义相符但可能过期，故在文档与日志里都写明，不假称已托管。
+                    item.put("url", img.url);
+                }
+                item.put("revised_prompt", prompt);
+                data.put(item);
+            }
+
+            JSONObject result = new JSONObject();
+            result.put("created", System.currentTimeMillis() / 1000);
+            result.put("data", data);
+            logBoth("Image generation OK: " + images.size() + " image(s), format="
+                    + (wantB64 ? "b64_json" : "url") + ", elapsed="
+                    + (System.currentTimeMillis() - startedAt) + "ms");
+            return new Response(200, "application/json", result.toString());
+        } catch (Throwable t) {
+            GatewayStats.incrFailed();
+            GatewayStats.countError("internal");
+            GatewayStats.setLastError(String.valueOf(t.getMessage()));
+            logBoth("handleImageGenerations error: " + t);
+            return errorResponse(500, "Internal Error", "api_error");
+        } finally {
+            if (acquired && limiter != null) {
+                limiter.release();
+            }
+            GatewayStats.decrActive();
+            GatewayStats.addLatency(System.currentTimeMillis() - startedAt);
+        }
+    }
+
+    /** 上一轮生图降级是否因「无法拉前台」而失败；由 {@link #runImageRound} 写入 */
+    private volatile boolean lastImageRoundWakeFailed = false;
+
+    /**
+     * 跑一轮生图注入并等待图片结果。
+     *
+     * <p>与对话端点 {@code doChatCompletions} 的重试结构一致（探测窗口快判 →
+     * 零回调则唤醒后重试 → 退避重试），差异只在<b>等待条件</b>与<b>窗口长度</b>：
+     * 生图实测 16.06s，远高于文本轮 2.3–4.0s，因此探测窗口与完整窗口都必须放宽，
+     * 否则正常的生图轮会被误判成「被吞」而重注入——那正好会撞上小布自己的
+     * 「当前已有生图任务正在进行」。</p>
+     *
+     * @return 本轮会话（已含图片或已完成）；拿不到返回 null
+     */
+    private ConversationSession runImageRound(String requestId, String injectText) {
+        lastImageRoundWakeFailed = false;
+        int maxRetry = ConfigManager.isAutoRetryEnabledInTarget()
+                ? ConfigManager.getAutoRetryMaxInTarget() : 0;
+        boolean allowWake = ConfigManager.isAutoWakeEnabledInTarget();
+        boolean wakeAttempted = false;
+
+        for (int attempt = 0; attempt <= maxRetry; attempt++) {
+            ConversationSession.beginExternalRound();
+            ConversationSession session = injectAndWaitForImage(requestId, injectText, IMAGE_PROBE_MS);
+            if (session != null) {
+                if (attempt > 0) {
+                    GatewayStats.incrAutoRetries();
+                }
+                return session;
+            }
+
+            if (allowWake && !wakeAttempted) {
+                wakeAttempted = true;
+                AutoWaker.WakeResult wake = AutoWaker.ensureForegroundDetailed();
+                logBoth("Image round: no callback in background round; fallback wake: " + wake);
+                if (!wake.foreground) {
+                    GatewayStats.countError("not_foreground");
+                    lastImageRoundWakeFailed = true;
+                    return null;
+                }
+                // 唤醒后的重试给足完整生图窗口（见 IMAGE_FULL_TIMEOUT_MS 的说明）
+                GatewayStats.incrAutoRetries();
+                ConversationSession.beginExternalRound();
+                session = injectAndWaitForImage(requestId, injectText, IMAGE_FULL_TIMEOUT_MS);
+                if (session != null) {
+                    return session;
+                }
+            }
+
+            if (attempt < maxRetry) {
+                logBoth("Image round: no callback on attempt " + (attempt + 1) + "/"
+                        + (maxRetry + 1) + ", retrying after backoff");
+                try {
+                    Thread.sleep(RETRY_BACKOFF_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        return null;
+    }
+
+    private ConversationSession injectAndWaitForImage(String requestId, String injectText, long windowMs) {
+        boolean injected = MainHook.injectUserMessage(injectText);
+        logBoth("Image round: injectUserMessage result=" + injected);
+        if (!injected) {
+            return null;
+        }
+        return waitForImageSession(requestId, windowMs);
+    }
+
+    /**
+     * 等待本轮会话产出图片。
+     *
+     * <p><b>与 {@link #waitForActiveSession} 的两点不同</b>：</p>
+     * <ol>
+     *   <li>等待条件含图片：{@code hasImages()} 或 {@code isCompleted()} 才算拿到。
+     *       不能用 {@code hasContent()} 提前收工——生图轮里正文是「已生成图片」，
+     *       更早的流式片段（如「正在为你生成」）可能在图片载荷之前到达。</li>
+     *   <li>完整窗口独立：引擎一旦接单（本轮会话被登记）就延长到
+     *       {@link #IMAGE_FULL_TIMEOUT_MS}，而不是对话端点的
+     *       {@code request_timeout}——生图本身就要十几秒起步。</li>
+     * </ol>
+     *
+     * @param windowMs 「引擎是否接单」的探测窗口
+     * @return 本轮会话；窗口内既无登记也无产出返回 null
+     */
+    private ConversationSession waitForImageSession(String requestId, long windowMs) {
+        long probeDeadline = System.currentTimeMillis() + windowMs;
+        long fullDeadline = System.currentTimeMillis() + IMAGE_FULL_TIMEOUT_MS;
+        boolean accepted = false;
+        while (System.currentTimeMillis() < (accepted ? fullDeadline : probeDeadline)) {
+            ConversationSession candidate = ConversationSession.getCurrentRound(5 * 60 * 1000L);
+            if (candidate != null) {
+                if (!accepted) {
+                    accepted = true;
+                    logBoth("Image round accepted (session registered), request=" + requestId
+                            + "; extending wait to " + IMAGE_FULL_TIMEOUT_MS + "ms");
+                }
+                if (candidate.hasImages() || candidate.isCompleted()) {
+                    logBoth("Image session ready for request " + requestId
+                            + ", images=" + (candidate.hasImages() ? "yes" : "no")
+                            + ", completed=" + candidate.isCompleted());
+                    return candidate;
+                }
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        logBoth("No image session within wait window, request=" + requestId);
+        return null;
+    }
+
+    /**
+     * 把客户端的生图 prompt 翻译成能触发小布文生图技能的自然语言。
+     *
+     * <p>OpenAI 的 {@code /v1/images/generations} 语义<b>本身</b>就是「生成图片」，
+     * 客户端的 prompt 通常只写画面描述（「一只戴帽子的猫」）。这样的裸描述交给小布
+     * 多半会被当成普通问答回答，因此需要补一个生图意图；prompt 里已经带了
+     * 「画 / 绘制 / 生成图 …」这类动词时不重复叠加。</p>
+     *
+     * <p><b>诚实标注</b>：这一步是「把端点语义翻成小布听得懂的话」，
+     * 属于推断而非从 dex 证实的契约——小布的意图分类在云端。
+     * 真机验证（{@code tools/verify_image_device.py}）就是冲这一点去的；
+     * 若实测发现小布对某类说法不认，改这里即可。</p>
+     */
+    private static String buildImagePrompt(String prompt) {
+        String p = prompt.trim();
+        java.util.regex.Matcher m = DRAW_INTENT.matcher(p);
+        if (m.find()) {
+            return p;
+        }
+        return IMAGE_INTENT_PREFIX + p;
+    }
+
+    /**
+     * 下载图片字节（生图结果是公开直链，实测无需任何鉴权/Cookie）。
+     *
+     * <p><b>为什么必须重试 404</b>：图片 URL 是<b>先于</b>对象可读被下发的。
+     * 真机实测（2026-09-18，小布 12.9.9）：载荷到达后立刻取会拿到
+     * {@code HTTP 404}，约 4–9s 后才 200（同一 URL，期间无重定向、无鉴权）。
+     * 这是 CDN 回源未完成的正常时序，不是 URL 失效。</p>
+     *
+     * <p>{@code response_format=url} 时网关不下载，所以这个缺陷在首轮真机验证里
+     * 被掩盖了——默认的 {@code b64_json} 必然踩到，且表现为「刚生成的图必然 502」。
+     * 因此把 404 与 5xx 当作<b>尚未就绪</b>做限时重试；其余状态码（401/403 等）
+     * 是确定性失败，立即抛出不做无谓等待。</p>
+     */
+    private byte[] downloadImageBytes(String url) throws IOException {
+        long deadline = System.currentTimeMillis() + IMAGE_DOWNLOAD_RETRY_BUDGET_MS;
+        IOException last = null;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return fetchImageOnce(url);
+            } catch (RetryableDownloadException e) {
+                last = e;
+            }
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) {
+                logBoth("Image download gave up after " + attempt + " attempt(s): " + last);
+                throw last;
+            }
+            logBoth("Image download attempt " + attempt + " not ready (" + last.getMessage()
+                    + "), retrying in " + IMAGE_DOWNLOAD_RETRY_INTERVAL_MS + "ms, left=" + left + "ms");
+            try {
+                Thread.sleep(Math.min(IMAGE_DOWNLOAD_RETRY_INTERVAL_MS, left));
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw last;
+            }
+        }
+    }
+
+    /** 上游尚未就绪（暂时性失败），可重试 */
+    private static final class RetryableDownloadException extends IOException {
+        RetryableDownloadException(String msg) {
+            super(msg);
+        }
+    }
+
+    /** 单次下载；只有「上游未就绪」才抛 {@link RetryableDownloadException} */
+    private byte[] fetchImageOnce(String url) throws IOException {
+        java.net.HttpURLConnection conn = null;
+        java.io.InputStream in = null;
+        try {
+            conn = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            conn.setConnectTimeout(IMAGE_DOWNLOAD_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(IMAGE_DOWNLOAD_READ_TIMEOUT_MS);
+            conn.setInstanceFollowRedirects(true);
+            conn.setRequestProperty("Accept", "image/*");
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                // 404 = CDN 还没回源到这张图；5xx = 上游瞬时故障。二者都值得等一会儿。
+                if (code == 404 || code >= 500) {
+                    throw new RetryableDownloadException("HTTP " + code);
+                }
+                throw new IOException("HTTP " + code);
+            }
+            in = conn.getInputStream();
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int total = 0;
+            int read;
+            while ((read = in.read(buf)) != -1) {
+                total += read;
+                if (total > IMAGE_DOWNLOAD_MAX_BYTES) {
+                    throw new IOException("image larger than " + IMAGE_DOWNLOAD_MAX_BYTES + " bytes");
+                }
+                bos.write(buf, 0, read);
+            }
+            if (total == 0) {
+                // 拿到 200 却零字节，同样是「还没写好」，按暂时性处理
+                throw new RetryableDownloadException("empty body");
+            }
+            return bos.toByteArray();
+        } catch (java.net.SocketTimeoutException e) {
+            // 连接/读取超时也按暂时性处理：这类失败重试比直接报 502 对调用方更有用
+            throw new RetryableDownloadException(e.toString());
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (IOException ignored) {}
+            }
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    /** 统一错误响应体（OpenAI 错误契约） */
+    private Response errorResponse(int code, String message, String type) {
+        JSONObject err = new JSONObject();
+        try {
+            err.put("message", message == null ? "" : message);
+            err.put("type", type);
+        } catch (Exception ignored) {
+        }
+        JSONObject body = new JSONObject();
+        try {
+            body.put("error", err);
+        } catch (Exception ignored) {
+        }
+        return new Response(code, "application/json", body.toString());
+    }
+
+    /** 取非空字符串字段；缺失、null、空串、空白串都返回 null */
+    private static String optNonEmpty(JSONObject o, String key) {
+        Object v = o.opt(key);
+        if (v == null || v == JSONObject.NULL) {
+            return null;
+        }
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    /**
      * 从请求体里取用户消息文本。
      *
      * <p>三种格式的取法不同：</p>
@@ -737,10 +1352,11 @@ public class OpenAIServer {
             ConversationSession session = null;
 
             // v3.13 后台静默：唤醒从「请求前无条件执行」改为「零回调后降级执行」。
-            // 后台注入（引擎已就绪时）实测可直接拿到回调，无需把小布拽到前台；
-            // 真正的失败场景是「小布进程刚起、对话引擎尚未预热」——此时后台首轮
-            // 必然零回调。故降级放在**首轮**零回调之后，而不是等所有退避重试耗尽
-            // （默认 maxRetry=3 × 60s 超时会让冷启动请求白等 4 分钟才唤起）。
+            // v3.14 归因更正：v3.13 把零回调解释为「进程刚起、引擎未预热」，
+            // 真机数据不支持该解释——零回调是概率性的，与前后台、与空闲时长都无
+            // 单调关系；冷启动只是其中一种情形。
+            // 故降级仍在**首轮**失败之后（而非等退避重试耗尽），但首轮改用一个
+            // 探测窗口快判，具体见循环内注释与 FIRST_ROUND_PROBE_MS。
             boolean hasText = userMsg != null && !userMsg.isEmpty();
             boolean allowWake = hasText && ConfigManager.isAutoWakeEnabledInTarget();
             boolean wakeAttempted = false;
@@ -751,7 +1367,17 @@ public class OpenAIServer {
             // ——那会把半截回答丢掉并浪费一次完整的等待窗口。
             for (int attempt = 0; attempt <= maxRetry; attempt++) {
                 ConversationSession.beginExternalRound();
-                session = runInjectedRound(requestId, userMsg, toolInjectText);
+                // v3.14：本轮用**探测窗口**快判「引擎有没有接单」。
+                // 零回调是概率性的，形态是引擎吞掉首次注入：注入返回 true 后
+                // 窗口内零回调、连 chatType=1 用户回显都没有；降级重注入后
+                // 1.5–3.5s 被引擎接单 → 引擎本身健康，吞的是这一条消息。
+                // 旧实现一律硬等满 request_timeout 才发现，被吞轮实测 60–127s，
+                // 76 轮受控 sweep 的正常轮 2.3–4.0s（另有慢回答轮不受此区间约束）。
+                //
+                // 探测窗口不是「提前放弃」：一旦引擎接单（本轮会话被登记），
+                // waitForActiveSession 会把等待延长到完整 request_timeout，
+                // 所以「接单但首字慢」的长回答不会被截断。
+                session = runInjectedRound(requestId, userMsg, toolInjectText, firstRoundProbeMs());
                 if (session != null) {
                     if (attempt > 0) {
                         GatewayStats.incrAutoRetries();
@@ -759,23 +1385,34 @@ public class OpenAIServer {
                     break;
                 }
 
-                // 首轮零回调即降级：拉前台后立刻重试一次（这是冷启动/引擎未就绪的
-                // 典型形态，继续在后台空耗退避窗口没有意义）。锁屏下唤醒会失败，
+                // 首轮零回调即降级：拉前台后立刻重试一次。锁屏下唤醒会失败，
                 // 此时直接放弃并返回 503，不做无意义的多轮重试。
                 if (allowWake && !wakeAttempted) {
                     wakeAttempted = true;
-                    long wakeStart = System.currentTimeMillis();
-                    boolean foreground = AutoWaker.ensureForeground();
-                    logBoth("No callback in background round; fallback AutoWake result=" + foreground
-                            + ", cost=" + (System.currentTimeMillis() - wakeStart) + "ms");
-                    if (!foreground) {
+                    AutoWaker.WakeResult wake = AutoWaker.ensureForegroundDetailed();
+                    // v3.14：据实拆分「本来就在前台」与「本次真的唤起了」。
+                    // 旧日志 result=true 的两种情形语义完全不同，会把人引回
+                    // 「必须前台才能拿回调」的旧结论（v3.13 取证时确实被误导过）。
+                    logBoth("No callback in background round; fallback wake: " + wake);
+                    if (!wake.foreground) {
                         GatewayStats.countError("not_foreground");
                         wakeFailed = true;
                         break;
                     }
                     GatewayStats.incrAutoRetries();
                     ConversationSession.beginExternalRound();
-                    session = runInjectedRound(requestId, userMsg, toolInjectText);
+                    // 唤醒后的这次重试给足**完整窗口**：这是刻意保守的取舍，不是实测结论。
+                    // v3.13 发布说明曾以「冷启动首答本身就要几十秒（35s / 62s 两次实测）」为由，
+                    // 但 v3.14 真机复测（force-stop 小布后重开）显示：冷启动下引擎
+                    // 1.53s 内即接单，全轮 16.90s；引擎「接单」时延（inject→accepted）
+                    // 92 次采样 1.53–7.01s、中位 2.51s（含正常轮）。
+                    // 也就是说 15s 探测窗口对冷启动同样够用（接单后会自动延长到完整超时）。
+                    // 之所以仍给完整窗口：唤醒路径本就低频（只在被吞后触发），
+                    // 多付一点等待换取「绝不截断慢回答」的确定性，取舍上更稳妥。
+                    // 代价：若这次重试也被吞，整轮会到 80.19s（实测），与 v3.13 发布版
+                    // 单次被吞轮（62.75–65.16s）同量级、未获改善。这是明知的取舍，故在此写明。
+                    session = runInjectedRound(requestId, userMsg, toolInjectText,
+                            ConfigManager.getRequestTimeoutMsInTarget());
                     if (session != null) {
                         break;
                     }
@@ -836,10 +1473,13 @@ public class OpenAIServer {
      * @param toolInjectText 带工具请求时已组装好的注入文本（含系统提示词与工具协议）；
      *                       非空时优先使用，且<b>不再</b>追加系统提示词 —— 它已经
      *                       并进折叠文本并参与了预算计算，再拼一次会顶过小布上限。
+     * @param windowMs 本轮等待回调的窗口上限（毫秒）。v3.14 起首轮传
+     *                 {@link #FIRST_ROUND_PROBE_MS} 做快判；唤醒后的降级轮传完整超时，
+     *                 其余重试轮仍传探测窗口（注意：并非所有非首轮都给完整窗口）。
      * @return 本轮会话；拿不到返回 null（由调用方转成错误响应）
      */
     private ConversationSession runInjectedRound(String requestId, String userMsg,
-                                                 String toolInjectText) {
+                                                 String toolInjectText, long windowMs) {
         String injectText;
         if (toolInjectText != null && !toolInjectText.isEmpty()) {
             injectText = toolInjectText;
@@ -861,27 +1501,55 @@ public class OpenAIServer {
             logBoth("injectUserMessage result=" + injected);
         } else {
             // 兼容没有 user message 的请求，但只接受屏障之后登记的会话。
-            session = waitForActiveSession(requestId, false);
+            // 这条路径没有「注入被吞」的概念（没注入），不适用探测窗口，
+            // 否则会把原本给足 60s 的兼容路径缩短成 15s，属于无谓的行为回退。
+            session = waitForActiveSession(requestId, false,
+                    ConfigManager.getRequestTimeoutMsInTarget());
         }
         if (session == null && injected) {
             // 注入成功后，等待本轮会话被 Hook 登记并收到完整回复
             logBoth("Waiting for response after injection...");
-            session = waitForActiveSession(requestId, true);
+            session = waitForActiveSession(requestId, true, windowMs);
         }
         return session;
     }
 
-    private ConversationSession waitForActiveSession(String requestId, boolean waitForInjectedResponse) {
+    /**
+     * 等待本轮会话就绪。
+     *
+     * <p><b>v3.14 两段式窗口</b>：{@code windowMs} 是「引擎是否接单」的探测窗口。
+     * 真机数据显示「被吞轮」与「接单但慢」在失败日志上几乎一样（都是零回调），
+     * 区别在于后者<b>会</b>把本轮会话登记进 {@link ConversationSession}
+     * （小布收到用户消息即回调 {@code chatType=1}）。所以：</p>
+     * <ul>
+     *   <li>窗口内既无产出、也无本轮登记 → 判定引擎吞了注入，返回 null 交调用方降级/重试；</li>
+     *   <li>窗口内出现本轮登记（哪怕还没有内容）→ 说明引擎已接单，正在生成，
+     *       把等待延长到完整 {@code request_timeout}，绝不打断半截回答；</li>
+     *   <li>一旦拿到内容，立即返回（受控 sweep 的正常轮 2.3–4.0s）。</li>
+     * </ul>
+     *
+     * @param waitForInjectedResponse true = 注入后等回答；false = 等已有活跃会话
+     * @param windowMs 探测窗口上限；&lt;=0 时不限制，直接用完整超时
+     */
+    private ConversationSession waitForActiveSession(String requestId, boolean waitForInjectedResponse,
+                                                     long windowMs) {
         // 只接受本轮屏障之后登记的会话，旧轮次即使仍在内存中也不可见。
         ConversationSession s = null;
-        // 注入后的回调可能受网络和主线程调度影响，等待上限由设置页的
-        // 「请求超时」控制（默认 60 秒），而非写死的 60 秒。
-        long deadline = System.currentTimeMillis()
-                + ConfigManager.getRequestTimeoutMsInTarget();
-        while (System.currentTimeMillis() < deadline) {
+        long probeWindow = windowMs > 0 ? windowMs : ConfigManager.getRequestTimeoutMsInTarget();
+        long probeDeadline = System.currentTimeMillis() + probeWindow;
+        // 引擎一旦「接单」（本轮会话被登记）就延长到完整超时，避免误判慢回答
+        long fullDeadline = System.currentTimeMillis() + ConfigManager.getRequestTimeoutMsInTarget();
+        boolean accepted = false;
+        while (System.currentTimeMillis() < (accepted ? fullDeadline : probeDeadline)) {
             ConversationSession candidate = ConversationSession.getCurrentRound(5 * 60 * 1000L);
             if (candidate != null) {
                 if (waitForInjectedResponse) {
+                    // 见到本轮登记即视为「已接单」：即便还没出内容，也说明引擎收到了。
+                    if (!accepted) {
+                        accepted = true;
+                        logBoth("Engine accepted round (session registered), request=" + requestId
+                                + "; extending wait to full timeout");
+                    }
                     if (candidate.isCompleted() || candidate.hasContent()) {
                         s = candidate;
                         break;

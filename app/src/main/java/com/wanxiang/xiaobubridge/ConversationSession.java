@@ -42,6 +42,26 @@ public class ConversationSession {
 
     // 流式内容队列
     private final LinkedBlockingQueue<String> contentQueue = new LinkedBlockingQueue<>();
+
+    /**
+     * 图片结果队列（v3.15，文生图取图用）。
+     *
+     * <p>与文本 {@link #contentQueue} 并列：文本仍按流式片段投递，图片是
+     * 「一轮一张（或几张）」的最终产物，不参与流式拼接。载体是
+     * {@link ImageResultCodec.ImageResult}，来源见
+     * {@code MainHook.handleBean} 对 {@code AIChatViewBean.payload} 的解析。</p>
+     */
+    private final LinkedBlockingQueue<ImageResultCodec.ImageResult> imageQueue =
+            new LinkedBlockingQueue<>();
+
+    /**
+     * 已入队图片的 URL 集合，用于跨通道去重。
+     *
+     * <p>同一个 bean 会同时从 {@code AIChatDataCenter.r} Hook 与 observer 代理
+     * 投递进来，图片与文本一样会被重复上报；URL 相同即同一张图，直接丢弃。</p>
+     */
+    private final java.util.Set<String> seenImageUrls = java.util.Collections.newSetFromMap(
+            new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
     // 是否已完成（收到 isFinal=true）
     private volatile boolean completed = false;
     // 最后活动时间戳
@@ -221,6 +241,18 @@ public class ConversationSession {
     }
 
     /**
+     * 本轮是否已有可交付的产出（文本或图片）（v3.15）。
+     *
+     * <p>文生图轮次的 {@code content} 只有「已生成图片」几个字，图片在
+     * {@code payload} 里异步解析入队，两者到达顺序不保证。等待逻辑用
+     * <b>本方法</b>而不是 {@link #hasContent()} 判「可以收工了」，
+     * 否则图片先到、文本后到（或反之）都可能被判成还没产出。</p>
+     */
+    public boolean hasAnyOutput() {
+        return hasContent() || hasImages();
+    }
+
+    /**
      * 记录最近一次用户提问内容（Hook 侧在 chatType=1 时调用）
      */
     public void setLastUserMessage(String message) {
@@ -320,6 +352,79 @@ public class ConversationSession {
     }
 
     /**
+     * 投递一批图片结果（v3.15，由 {@code MainHook.handleBean} 在解析 payload 后调用）。
+     *
+     * <p>URL 去重在本方法内完成：多通道重复上报与「payload + markdownCardInfos
+     * 同时命中同一张图」都会在这里被收敛成一条。空 URL 直接丢弃。</p>
+     *
+     * @param images 已抽取的图片结果；可为 null / 空
+     * @return 真正入队的张数
+     */
+    public int offerImages(java.util.List<ImageResultCodec.ImageResult> images) {
+        if (images == null || images.isEmpty()) {
+            return 0;
+        }
+        int added = 0;
+        for (ImageResultCodec.ImageResult img : images) {
+            if (img == null || img.url == null || img.url.isEmpty()) {
+                continue;
+            }
+            if (!seenImageUrls.add(img.url)) {
+                XposedBridge.log(TAG + " Dedup: duplicate image dropped, url=" + img.url);
+                continue;
+            }
+            imageQueue.offer(img);
+            added++;
+        }
+        if (added > 0) {
+            touch();
+            XposedBridge.log(TAG + " Offered " + added + " image(s), queued=" + imageQueue.size());
+        }
+        return added;
+    }
+
+    /**
+     * 非阻塞取出一张图片结果（v3.15）。
+     *
+     * @return 队首图片；队列为空返回 null
+     */
+    public ImageResultCodec.ImageResult pollImage() {
+        ImageResultCodec.ImageResult img = imageQueue.poll();
+        if (img != null) {
+            touch();
+        }
+        return img;
+    }
+
+    /**
+     * 取走当前已入队的全部图片（v3.15）。
+     *
+     * <p>文生图的图片是「一轮的最终产物」而非流式片段，调用方一次拿完即可，
+     * 因此提供批量取用而不是逐个 poll。</p>
+     *
+     * @return 图片列表；无图片返回空列表
+     */
+    public java.util.List<ImageResultCodec.ImageResult> drainImages() {
+        java.util.List<ImageResultCodec.ImageResult> out = new java.util.ArrayList<>();
+        ImageResultCodec.ImageResult img;
+        while ((img = imageQueue.poll()) != null) {
+            out.add(img);
+        }
+        if (!out.isEmpty()) {
+            touch();
+        }
+        return out;
+    }
+
+    /**
+     * 当前是否已有图片入队（v3.15）。
+     * 供等待逻辑判断「本轮要不要继续等图」，同时不影响文本内容的判定。
+     */
+    public boolean hasImages() {
+        return !imageQueue.isEmpty();
+    }
+
+    /**
      * 阻塞等待下一个内容片段
      * @return 内容片段，超时返回 null
      */
@@ -400,6 +505,10 @@ public class ConversationSession {
 
     private void prepareForNewRound(boolean updateRoundStart) {
         contentQueue.clear();
+        // 图片槽位与文本队列同生命周期：新一轮开始时必须一起清空，
+        // 否则上一轮的图会被本轮当作结果返回（recordId 复用时会真的发生）。
+        imageQueue.clear();
+        seenImageUrls.clear();
         synchronized (fullContent) {
             fullContent.setLength(0);
         }
